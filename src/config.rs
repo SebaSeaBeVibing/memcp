@@ -21,10 +21,19 @@ pub struct Config {
     /// Optional file path for log output (in addition to stderr)
     #[serde(default)]
     pub log_file: Option<String>,
+
+    /// SQLite database path. Supports sqlite:// URI scheme.
+    /// Configurable via MEMCP_DB_PATH env var or db_path in memcp.toml.
+    #[serde(default = "default_db_path")]
+    pub db_path: String,
 }
 
 fn default_log_level() -> String {
     "info".to_string()
+}
+
+fn default_db_path() -> String {
+    "sqlite://memcp.db".to_string()
 }
 
 impl Default for Config {
@@ -32,6 +41,7 @@ impl Default for Config {
         Config {
             log_level: default_log_level(),
             log_file: None,
+            db_path: default_db_path(),
         }
     }
 }
@@ -60,5 +70,6 @@ mod tests {
         let config = Config::default();
         assert_eq!(config.log_level, "info");
         assert_eq!(config.log_file, None);
+        assert_eq!(config.db_path, "sqlite://memcp.db");
     }
 }

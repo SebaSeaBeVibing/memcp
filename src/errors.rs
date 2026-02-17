@@ -21,6 +21,15 @@ pub enum MemcpError {
 
     #[error("Internal error: {0}")]
     Internal(String),
+
+    #[error("Storage error: {0}")]
+    Storage(String),
+}
+
+impl From<sqlx::Error> for MemcpError {
+    fn from(e: sqlx::Error) -> Self {
+        MemcpError::Storage(e.to_string())
+    }
 }
 
 impl MemcpError {
