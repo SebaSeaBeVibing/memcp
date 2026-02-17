@@ -170,7 +170,7 @@ fn test_tool_discovery() {
     assert!(response["result"]["tools"].is_array());
 
     let tools = response["result"]["tools"].as_array().unwrap();
-    assert_eq!(tools.len(), 6, "Should have exactly 6 tools");
+    assert_eq!(tools.len(), 8, "Should have exactly 8 tools");
 
     // Check all expected tools are present
     let tool_names: Vec<String> = tools.iter()
@@ -178,10 +178,12 @@ fn test_tool_discovery() {
         .collect();
 
     assert!(tool_names.contains(&"store_memory".to_string()));
-    assert!(tool_names.contains(&"search_memory".to_string()));
+    assert!(tool_names.contains(&"get_memory".to_string()));
     assert!(tool_names.contains(&"update_memory".to_string()));
     assert!(tool_names.contains(&"delete_memory".to_string()));
+    assert!(tool_names.contains(&"bulk_delete_memories".to_string()));
     assert!(tool_names.contains(&"list_memories".to_string()));
+    assert!(tool_names.contains(&"search_memory".to_string()));
     assert!(tool_names.contains(&"health_check".to_string()));
 
     // Verify each tool has required fields
@@ -195,6 +197,9 @@ fn test_tool_discovery() {
 #[test]
 fn test_store_memory_success() {
     let client = McpClient::spawn();
+
+    // Give SQLite store a moment to initialize before the first request
+    thread::sleep(Duration::from_millis(200));
 
     // Initialize
     let initialize_request = json!({
@@ -215,7 +220,7 @@ fn test_store_memory_success() {
         "method": "notifications/initialized"
     }));
 
-    // Call store_memory tool with valid params
+    // Call store_memory tool with valid params (Phase 2 API: content, type_hint, source, tags)
     let store_request = json!({
         "jsonrpc": "2.0",
         "method": "tools/call",
@@ -224,7 +229,8 @@ fn test_store_memory_success() {
             "name": "store_memory",
             "arguments": {
                 "content": "test memory content",
-                "agent_id": "test-agent"
+                "type_hint": "fact",
+                "source": "test"
             }
         }
     });
@@ -247,8 +253,9 @@ fn test_store_memory_success() {
     if result["structuredContent"].is_object() {
         let content = &result["structuredContent"];
         assert!(content["id"].is_string(), "Should have an ID");
-        assert_eq!(content["agent_id"], "test-agent");
         assert_eq!(content["content"], "test memory content");
+        assert_eq!(content["type_hint"], "fact");
+        assert_eq!(content["source"], "test");
         assert!(content["created_at"].is_string(), "Should have timestamp");
 
         // Verify ID looks like a UUID

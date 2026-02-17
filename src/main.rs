@@ -1,7 +1,9 @@
 use anyhow::Result;
+use std::sync::Arc;
 use memcp::config::Config;
 use memcp::logging;
 use memcp::server::MemoryService;
+use memcp::store::sqlite::SqliteMemoryStore;
 use rmcp::ServiceExt;
 
 #[tokio::main]
@@ -21,16 +23,23 @@ async fn main() -> Result<()> {
         "memcp server starting"
     );
 
-    // 3. Create service
-    let service = MemoryService::new();
+    // 3. Initialize persistent SQLite store
+    let store = SqliteMemoryStore::new(&config.db_path)
+        .await
+        .expect("Failed to initialize database");
 
-    // 4. Serve via stdio transport
+    tracing::info!(db_path = %config.db_path, "SQLite store initialized");
+
+    // 4. Create service with store
+    let service = MemoryService::new(Arc::new(store));
+
+    // 5. Serve via stdio transport
     let (stdin, stdout) = rmcp::transport::io::stdio();
     let server = service.serve((stdin, stdout)).await?;
 
     tracing::info!("memcp server running — awaiting tool calls via stdio");
 
-    // 5. Wait for shutdown (client disconnects or signal)
+    // 6. Wait for shutdown (client disconnects or signal)
     server.waiting().await?;
 
     tracing::info!("memcp server stopped");
