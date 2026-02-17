@@ -1,0 +1,8 @@
+target/
+.git/
+.gitignore
+.planning/
+*.md
+memcp.db*
+.cargo/
+.claude/
