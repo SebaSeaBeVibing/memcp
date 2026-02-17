@@ -1,8 +1,13 @@
 use rmcp::{
     ServerHandler,
     tool,
-    model::{ServerCapabilities, Implementation, ProtocolVersion, CallToolResult},
+    model::{
+        ServerCapabilities, Implementation, ProtocolVersion, CallToolResult,
+        RawResource, ListResourcesResult, ReadResourceResult, ResourceContents,
+        ReadResourceRequestParams, AnnotateAble,
+    },
     handler::server::wrapper::Parameters,
+    service::{RequestContext, RoleServer},
     ErrorData as McpError,
 };
 use serde::{Deserialize, Serialize};
@@ -13,7 +18,7 @@ use std::time::Instant;
 use chrono::DateTime;
 
 use crate::errors::MemcpError;
-use crate::store::{CreateMemory, ListFilter, MemoryStore, UpdateMemory};
+use crate::store::{CreateMemory, ListFilter, Memory, MemoryStore, UpdateMemory};
 
 pub struct MemoryService {
     store: Arc<dyn MemoryStore + Send + Sync>,
@@ -564,6 +569,27 @@ impl MemoryService {
     }
 }
 
+// Helper: format a slice of memories into human-readable text for resource consumption
+fn format_memories_text(memories: &[Memory]) -> String {
+    if memories.is_empty() {
+        return String::new();
+    }
+    memories
+        .iter()
+        .map(|m| {
+            format!(
+                "---\n[{}] {}\nCreated: {} | Source: {} | Accessed: {} times\n---",
+                m.type_hint,
+                m.content,
+                m.created_at.to_rfc3339(),
+                m.source,
+                m.access_count
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
 // ServerHandler implementation
 #[rmcp::tool_handler(router = Self::tool_router())]
 impl ServerHandler for MemoryService {
@@ -572,6 +598,7 @@ impl ServerHandler for MemoryService {
             protocol_version: ProtocolVersion::V_2024_11_05,
             capabilities: ServerCapabilities::builder()
                 .enable_tools()
+                .enable_resources()
                 .build(),
             server_info: Implementation {
                 name: "memcp".to_string(),
@@ -582,8 +609,99 @@ impl ServerHandler for MemoryService {
                 website_url: None,
             },
             instructions: Some(
-                "Memory server for AI agents. Tools: store_memory, get_memory, update_memory, delete_memory, bulk_delete_memories, list_memories, search_memory (stub), health_check. All tool responses include usage hints for next steps.".to_string()
+                "Memory server for AI agents. Tools: store_memory, get_memory, search_memory, update_memory, delete_memory, bulk_delete_memories, list_memories, health_check. Resources: memory://session-primer (recent memories), memory://user-profile (preferences).".to_string()
             ),
+        }
+    }
+
+    async fn list_resources(
+        &self,
+        _request: Option<rmcp::model::PaginatedRequestParams>,
+        _context: RequestContext<RoleServer>,
+    ) -> Result<ListResourcesResult, McpError> {
+        Ok(ListResourcesResult {
+            meta: None,
+            resources: vec![
+                RawResource {
+                    uri: "memory://session-primer".to_string(),
+                    name: "session-primer".to_string(),
+                    title: Some("Session Memory Primer".to_string()),
+                    description: Some("Recent memories for session context".to_string()),
+                    mime_type: Some("text/plain".to_string()),
+                    size: None,
+                    icons: None,
+                    meta: None,
+                }
+                .no_annotation(),
+                RawResource {
+                    uri: "memory://user-profile".to_string(),
+                    name: "user-profile".to_string(),
+                    title: Some("User Profile".to_string()),
+                    description: Some("User preferences and persistent facts".to_string()),
+                    mime_type: Some("text/plain".to_string()),
+                    size: None,
+                    icons: None,
+                    meta: None,
+                }
+                .no_annotation(),
+            ],
+            next_cursor: None,
+        })
+    }
+
+    async fn read_resource(
+        &self,
+        request: ReadResourceRequestParams,
+        _context: RequestContext<RoleServer>,
+    ) -> Result<ReadResourceResult, McpError> {
+        match request.uri.as_str() {
+            "memory://session-primer" => {
+                let filter = ListFilter {
+                    limit: 20,
+                    ..Default::default()
+                };
+                let result = self
+                    .store
+                    .list(filter)
+                    .await
+                    .map_err(|e| McpError::resource_not_found(e.to_string(), None))?;
+
+                let text = if result.memories.is_empty() {
+                    "No memories stored yet. Use store_memory to add your first memory.".to_string()
+                } else {
+                    format_memories_text(&result.memories)
+                };
+
+                Ok(ReadResourceResult {
+                    contents: vec![ResourceContents::text(text, request.uri)],
+                })
+            }
+            "memory://user-profile" => {
+                let filter = ListFilter {
+                    type_hint: Some("preference".to_string()),
+                    limit: 50,
+                    ..Default::default()
+                };
+                let result = self
+                    .store
+                    .list(filter)
+                    .await
+                    .map_err(|e| McpError::resource_not_found(e.to_string(), None))?;
+
+                let text = if result.memories.is_empty() {
+                    "No user preferences stored yet. Use store_memory with type_hint: 'preference' to add preferences.".to_string()
+                } else {
+                    format_memories_text(&result.memories)
+                };
+
+                Ok(ReadResourceResult {
+                    contents: vec![ResourceContents::text(text, request.uri)],
+                })
+            }
+            uri => Err(McpError::resource_not_found(
+                format!("Resource not found: {}", uri),
+                None,
+            )),
         }
     }
 }
