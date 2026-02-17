@@ -5,46 +5,6 @@ use std::thread;
 use std::time::Duration;
 use serde_json::{json, Value};
 
-/// A temporary SQLite database file that is deleted when dropped.
-///
-/// Uses a unique path in the system temp directory to avoid test interference.
-struct TempDb {
-    path: String,
-}
-
-impl TempDb {
-    fn new() -> Self {
-        // Use thread ID + timestamp for uniqueness without external crates
-        let id = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .subsec_nanos();
-        let thread_id = format!("{:?}", std::thread::current().id())
-            .chars()
-            .filter(|c| c.is_alphanumeric())
-            .collect::<String>();
-        let path = format!("{}/memcp_test_{}_{}.db",
-            std::env::temp_dir().display(), thread_id, id);
-        // Create the file so the path is reserved
-        std::fs::File::create(&path).expect("Failed to create temp db file");
-        TempDb { path }
-    }
-
-    fn path(&self) -> &str {
-        &self.path
-    }
-}
-
-impl Drop for TempDb {
-    fn drop(&mut self) {
-        // Clean up temp files (ignore errors - they may already be gone)
-        let _ = std::fs::remove_file(&self.path);
-        // Also remove WAL and SHM files that SQLite creates
-        let _ = std::fs::remove_file(format!("{}-wal", self.path));
-        let _ = std::fs::remove_file(format!("{}-shm", self.path));
-    }
-}
-
 /// Helper struct to manage server process with async I/O
 struct McpClient {
     child: std::process::Child,
@@ -128,10 +88,11 @@ impl Drop for McpClient {
     }
 }
 
-/// Test client with a custom DB path for isolation.
+/// Test client that connects to PostgreSQL via DATABASE_URL env var.
 ///
-/// Uses a tempfile-backed SQLite path so each test has its own DB.
-/// Wraps McpClient internals to support MEMCP_DB_PATH env var.
+/// Integration tests requiring data isolation should use separate PostgreSQL
+/// schemas or databases — managed by Docker Compose in Plan 02 / CI in Plan 03.
+/// For now, tests share the same database and clean up after themselves.
 struct McpTestClient {
     child: std::process::Child,
     tx: Sender<Value>,
@@ -140,10 +101,13 @@ struct McpTestClient {
 }
 
 impl McpTestClient {
-    /// Spawn a client with a given db file path.
-    fn spawn_with_db(db_path: &str) -> Self {
+    /// Spawn a client using DATABASE_URL from environment (or default postgres://memcp:memcp@localhost:5432/memcp).
+    fn spawn() -> Self {
+        let database_url = std::env::var("DATABASE_URL")
+            .unwrap_or_else(|_| "postgres://memcp:memcp@localhost:5432/memcp".to_string());
+
         let mut child = Command::new(env!("CARGO_BIN_EXE_memcp"))
-            .env("MEMCP_DB_PATH", db_path)
+            .env("DATABASE_URL", &database_url)
             .env("MEMCP_LOG_LEVEL", "warn")
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
@@ -293,12 +257,6 @@ impl Drop for McpTestClient {
     }
 }
 
-/// Create a unique temp db for test isolation.
-/// The TempDb cleans up on drop.
-fn temp_db() -> TempDb {
-    TempDb::new()
-}
-
 // =============================================================================
 // Phase 1 Integration Tests (preserved)
 // =============================================================================
@@ -413,7 +371,7 @@ fn test_tool_discovery() {
 fn test_store_memory_success() {
     let client = McpClient::spawn();
 
-    // Give SQLite store a moment to initialize before the first request
+    // Give PostgreSQL store a moment to initialize before the first request
     thread::sleep(Duration::from_millis(200));
 
     // Initialize
@@ -653,12 +611,13 @@ fn test_search_memory() {
 
 // =============================================================================
 // Phase 2 CRUD Integration Tests
+// Note: These tests require a running PostgreSQL instance.
+// Run with: DATABASE_URL=postgres://memcp:memcp@localhost:5432/memcp cargo test
 // =============================================================================
 
 #[test]
 fn test_store_and_get_memory() {
-    let tempdb = temp_db();
-    let client = McpTestClient::spawn_with_db(tempdb.path());
+    let client = McpTestClient::spawn();
     client.initialize();
 
     // Store a memory
@@ -699,8 +658,7 @@ fn test_store_and_get_memory() {
 
 #[test]
 fn test_update_memory() {
-    let tempdb = temp_db();
-    let client = McpTestClient::spawn_with_db(tempdb.path());
+    let client = McpTestClient::spawn();
     client.initialize();
 
     // Store a memory
@@ -734,8 +692,7 @@ fn test_update_memory() {
 
 #[test]
 fn test_delete_memory() {
-    let tempdb = temp_db();
-    let client = McpTestClient::spawn_with_db(tempdb.path());
+    let client = McpTestClient::spawn();
     client.initialize();
 
     // Store a memory
@@ -762,8 +719,7 @@ fn test_delete_memory() {
 
 #[test]
 fn test_list_memories_with_pagination() {
-    let tempdb = temp_db();
-    let client = McpTestClient::spawn_with_db(tempdb.path());
+    let client = McpTestClient::spawn();
     client.initialize();
 
     // Store 5 memories
@@ -823,8 +779,7 @@ fn test_list_memories_with_pagination() {
 
 #[test]
 fn test_list_memories_with_filter() {
-    let tempdb = temp_db();
-    let client = McpTestClient::spawn_with_db(tempdb.path());
+    let client = McpTestClient::spawn();
     client.initialize();
 
     // Store memories with different type_hints
@@ -846,8 +801,7 @@ fn test_list_memories_with_filter() {
 
 #[test]
 fn test_bulk_delete_two_step() {
-    let tempdb = temp_db();
-    let client = McpTestClient::spawn_with_db(tempdb.path());
+    let client = McpTestClient::spawn();
     client.initialize();
 
     // Store 3 "temporary" and 2 "permanent" memories
@@ -901,14 +855,14 @@ fn test_bulk_delete_two_step() {
 
 #[test]
 fn test_persistence_across_restart() {
-    // Use a named temp file path (not deleted until _tempfile drops at end of test)
-    let tempdb = temp_db();
+    let database_url = std::env::var("DATABASE_URL")
+        .unwrap_or_else(|_| "postgres://memcp:memcp@localhost:5432/memcp".to_string());
 
     let memory_id;
 
     // First server instance: store a memory
     {
-        let client = McpTestClient::spawn_with_db(tempdb.path());
+        let client = McpTestClient::spawn();
         client.initialize();
 
         let store_resp = client.call_tool("store_memory", json!({
@@ -923,6 +877,7 @@ fn test_persistence_across_restart() {
             .as_str().unwrap().to_string();
 
         // client drops here, killing the server process
+        drop(database_url);
     }
 
     // Give the first server time to fully shut down
@@ -930,7 +885,7 @@ fn test_persistence_across_restart() {
 
     // Second server instance: retrieve the memory from the same DB
     {
-        let client2 = McpTestClient::spawn_with_db(tempdb.path());
+        let client2 = McpTestClient::spawn();
         client2.initialize();
 
         let get_resp = client2.call_tool("get_memory", json!({"id": memory_id}));
@@ -951,8 +906,7 @@ fn test_persistence_across_restart() {
 
 #[test]
 fn test_resources_list_and_read() {
-    let tempdb = temp_db();
-    let client = McpTestClient::spawn_with_db(tempdb.path());
+    let client = McpTestClient::spawn();
     client.initialize();
 
     // Store some memories including a preference
@@ -1008,8 +962,7 @@ fn test_resources_list_and_read() {
 
 #[test]
 fn test_validation_errors() {
-    let tempdb = temp_db();
-    let client = McpTestClient::spawn_with_db(tempdb.path());
+    let client = McpTestClient::spawn();
     client.initialize();
 
     // Empty content validation

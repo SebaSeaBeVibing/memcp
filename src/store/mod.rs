@@ -1,7 +1,7 @@
 /// Memory store abstraction layer
 ///
 /// Provides the MemoryStore trait and associated types for CRUD operations on memories.
-/// The trait abstraction enables future database backends (e.g., PostgreSQL in Phase 3).
+/// The trait abstraction enables multiple database backends — currently PostgreSQL.
 
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
@@ -9,7 +9,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::errors::MemcpError;
 
-pub mod sqlite;
+pub mod postgres;
 
 /// Represents a stored memory with all rich metadata fields.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -22,7 +22,7 @@ pub struct Memory {
     pub type_hint: String,
     /// Origin source: "user", "assistant", "system", etc.
     pub source: String,
-    /// Optional tags for categorization (JSON array stored as TEXT in SQLite)
+    /// Optional tags for categorization (stored as JSONB in PostgreSQL)
     pub tags: Option<serde_json::Value>,
     /// When the memory was created
     pub created_at: DateTime<Utc>,
