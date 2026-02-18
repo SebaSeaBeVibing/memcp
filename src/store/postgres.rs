@@ -10,6 +10,7 @@ use sqlx::{
     postgres::{PgPool, PgPoolOptions, PgRow},
     Row,
 };
+use std::collections::HashMap;
 use std::time::Duration;
 use uuid::Uuid;
 
@@ -18,6 +19,28 @@ use crate::store::{
     encode_search_cursor, CreateMemory, ListFilter, ListResult, Memory, MemoryStore,
     SearchFilter, SearchHit, SearchResult, UpdateMemory,
 };
+
+/// FSRS state row fetched from memory_salience table.
+///
+/// Missing rows are represented as defaults (stability=1.0, difficulty=5.0, count=0).
+#[derive(Debug, Clone)]
+pub struct SalienceRow {
+    pub stability: f64,
+    pub difficulty: f64,
+    pub reinforcement_count: i32,
+    pub last_reinforced_at: Option<DateTime<Utc>>,
+}
+
+impl Default for SalienceRow {
+    fn default() -> Self {
+        SalienceRow {
+            stability: 1.0,
+            difficulty: 5.0,
+            reinforcement_count: 0,
+            last_reinforced_at: None,
+        }
+    }
+}
 
 /// PostgreSQL-backed memory store using sqlx connection pool.
 pub struct PostgresMemoryStore {
@@ -684,6 +707,100 @@ impl PostgresMemoryStore {
     /// Return the underlying PgPool so embedding pipeline can share the connection pool.
     pub fn pool(&self) -> &PgPool {
         &self.pool
+    }
+
+    /// Fetch salience rows for a batch of memory IDs from memory_salience table.
+    ///
+    /// Returns defaults (stability=1.0, difficulty=5.0, count=0) for IDs with no row.
+    /// Uses ANY($1) array binding for efficient batch fetch.
+    pub async fn get_salience_data(
+        &self,
+        memory_ids: &[String],
+    ) -> Result<HashMap<String, SalienceRow>, MemcpError> {
+        if memory_ids.is_empty() {
+            return Ok(HashMap::new());
+        }
+
+        let rows = sqlx::query(
+            "SELECT memory_id, stability, difficulty, reinforcement_count, last_reinforced_at \
+             FROM memory_salience \
+             WHERE memory_id = ANY($1)",
+        )
+        .bind(memory_ids)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|e| MemcpError::Storage(format!("Failed to fetch salience data: {}", e)))?;
+
+        let mut map: HashMap<String, SalienceRow> = HashMap::with_capacity(rows.len());
+        for row in &rows {
+            let memory_id: String = row
+                .try_get("memory_id")
+                .map_err(|e| MemcpError::Storage(e.to_string()))?;
+            let stability: f64 = row
+                .try_get("stability")
+                .map_err(|e| MemcpError::Storage(e.to_string()))?;
+            let difficulty: f64 = row
+                .try_get("difficulty")
+                .map_err(|e| MemcpError::Storage(e.to_string()))?;
+            let reinforcement_count: i32 = row
+                .try_get("reinforcement_count")
+                .map_err(|e| MemcpError::Storage(e.to_string()))?;
+            let last_reinforced_at: Option<DateTime<Utc>> = row
+                .try_get("last_reinforced_at")
+                .map_err(|e| MemcpError::Storage(e.to_string()))?;
+            map.insert(
+                memory_id,
+                SalienceRow {
+                    stability,
+                    difficulty,
+                    reinforcement_count,
+                    last_reinforced_at,
+                },
+            );
+        }
+
+        // Fill defaults for IDs not in the table
+        for id in memory_ids {
+            map.entry(id.clone()).or_default();
+        }
+
+        Ok(map)
+    }
+
+    /// Insert or update the salience row for a memory (FSRS state).
+    ///
+    /// Uses INSERT ON CONFLICT DO UPDATE to handle both create and update atomically.
+    pub async fn upsert_salience(
+        &self,
+        memory_id: &str,
+        stability: f64,
+        difficulty: f64,
+        reinforcement_count: i32,
+        last_reinforced_at: Option<DateTime<Utc>>,
+    ) -> Result<(), MemcpError> {
+        let now = Utc::now();
+        sqlx::query(
+            "INSERT INTO memory_salience \
+             (memory_id, stability, difficulty, reinforcement_count, last_reinforced_at, created_at, updated_at) \
+             VALUES ($1, $2, $3, $4, $5, $6, $6) \
+             ON CONFLICT (memory_id) DO UPDATE SET \
+               stability = EXCLUDED.stability, \
+               difficulty = EXCLUDED.difficulty, \
+               reinforcement_count = EXCLUDED.reinforcement_count, \
+               last_reinforced_at = EXCLUDED.last_reinforced_at, \
+               updated_at = EXCLUDED.updated_at",
+        )
+        .bind(memory_id)
+        .bind(stability)
+        .bind(difficulty)
+        .bind(reinforcement_count)
+        .bind(last_reinforced_at)
+        .bind(&now)
+        .execute(&self.pool)
+        .await
+        .map_err(|e| MemcpError::Storage(format!("Failed to upsert salience: {}", e)))?;
+
+        Ok(())
     }
 
     /// Search for memories semantically similar to the query embedding.
