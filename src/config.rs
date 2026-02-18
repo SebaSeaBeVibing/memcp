@@ -13,6 +13,79 @@ use figment::{
 use serde::{Deserialize, Serialize};
 use crate::errors::MemcpError;
 
+/// Configuration for the search subsystem.
+///
+/// BM25 backend selection is explicit — having ParadeDB installed does NOT auto-switch.
+/// Nested env var overrides use double underscores:
+///   MEMCP_SEARCH__BM25_BACKEND=paradedb
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SearchConfig {
+    /// BM25 backend: "native" (PostgreSQL tsvector, default) or "paradedb" (pg_search extension)
+    /// Default: "native" — no extension required for self-hosted deployments
+    #[serde(default = "default_bm25_backend")]
+    pub bm25_backend: String,
+}
+
+fn default_bm25_backend() -> String {
+    "native".to_string()
+}
+
+impl Default for SearchConfig {
+    fn default() -> Self {
+        SearchConfig {
+            bm25_backend: default_bm25_backend(),
+        }
+    }
+}
+
+/// Configuration for the salience scoring subsystem.
+///
+/// Weights control how much each dimension contributes to the final salience score.
+/// All four weights should ideally sum to 1.0 (they are not automatically normalized).
+/// Nested env var overrides use double underscores:
+///   MEMCP_SALIENCE__W_RECENCY=0.30
+///   MEMCP_SALIENCE__DEBUG_SCORING=true
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SalienceConfig {
+    /// Weight for recency dimension (default: 0.25)
+    #[serde(default = "default_w_recency")]
+    pub w_recency: f64,
+    /// Weight for access frequency dimension (default: 0.15)
+    #[serde(default = "default_w_access")]
+    pub w_access: f64,
+    /// Weight for semantic relevance dimension (default: 0.45)
+    #[serde(default = "default_w_semantic")]
+    pub w_semantic: f64,
+    /// Weight for reinforcement strength dimension (default: 0.15)
+    #[serde(default = "default_w_reinforce")]
+    pub w_reinforce: f64,
+    /// Exponential recency decay rate (default: 0.01, ~70-day half-life)
+    #[serde(default = "default_recency_lambda")]
+    pub recency_lambda: f64,
+    /// Enable debug scoring output (shows dimension breakdown in results)
+    #[serde(default)]
+    pub debug_scoring: bool,
+}
+
+fn default_w_recency() -> f64 { 0.25 }
+fn default_w_access() -> f64 { 0.15 }
+fn default_w_semantic() -> f64 { 0.45 }
+fn default_w_reinforce() -> f64 { 0.15 }
+fn default_recency_lambda() -> f64 { 0.01 }
+
+impl Default for SalienceConfig {
+    fn default() -> Self {
+        SalienceConfig {
+            w_recency: default_w_recency(),
+            w_access: default_w_access(),
+            w_semantic: default_w_semantic(),
+            w_reinforce: default_w_reinforce(),
+            recency_lambda: default_recency_lambda(),
+            debug_scoring: false,
+        }
+    }
+}
+
 /// Configuration for the embedding provider subsystem.
 ///
 /// Provider selection is explicit — having an API key does NOT auto-switch from local.
@@ -75,6 +148,16 @@ pub struct Config {
     /// Existing configs without [embedding] section still work (serde default applied).
     #[serde(default)]
     pub embedding: EmbeddingConfig,
+
+    /// Search subsystem configuration.
+    /// Existing configs without [search] section still work (serde default applied).
+    #[serde(default)]
+    pub search: SearchConfig,
+
+    /// Salience scoring configuration.
+    /// Existing configs without [salience] section still work (serde default applied).
+    #[serde(default)]
+    pub salience: SalienceConfig,
 }
 
 fn default_log_level() -> String {
@@ -92,6 +175,8 @@ impl Default for Config {
             log_file: None,
             database_url: default_database_url(),
             embedding: EmbeddingConfig::default(),
+            search: SearchConfig::default(),
+            salience: SalienceConfig::default(),
         }
     }
 }
@@ -128,5 +213,6 @@ mod tests {
         assert_eq!(config.database_url, "postgres://memcp:memcp@localhost:5432/memcp");
         assert_eq!(config.embedding.provider, "local");
         assert_eq!(config.embedding.openai_api_key, None);
+        assert_eq!(config.search.bm25_backend, "native");
     }
 }
