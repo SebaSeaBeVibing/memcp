@@ -1019,6 +1019,107 @@ impl PostgresMemoryStore {
         })
     }
 
+    /// Fetch full Memory objects for a list of IDs.
+    ///
+    /// Returns a HashMap<id, Memory> for efficient lookup by ID.
+    /// IDs not found in the database are simply absent from the result.
+    pub async fn get_memories_by_ids(
+        &self,
+        ids: &[String],
+    ) -> Result<HashMap<String, Memory>, MemcpError> {
+        if ids.is_empty() {
+            return Ok(HashMap::new());
+        }
+
+        let rows = sqlx::query(
+            "SELECT id, content, type_hint, source, tags, created_at, updated_at, \
+             last_accessed_at, access_count, embedding_status \
+             FROM memories WHERE id = ANY($1)",
+        )
+        .bind(ids)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|e| MemcpError::Storage(format!("Failed to fetch memories by ids: {}", e)))?;
+
+        let mut map = HashMap::with_capacity(rows.len());
+        for row in &rows {
+            let memory = row_to_memory(row)?;
+            map.insert(memory.id.clone(), memory);
+        }
+        Ok(map)
+    }
+
+    /// Orchestrate hybrid BM25 + vector search with RRF fusion.
+    ///
+    /// Both legs run independently with a candidate pool of 40 results each.
+    /// When query_embedding is None (embedding provider unavailable), gracefully
+    /// falls back to BM25-only results.
+    ///
+    /// Salience re-ranking is NOT performed here — the server layer applies it
+    /// after fetching salience data from the database.
+    pub async fn hybrid_search(
+        &self,
+        query_text: &str,
+        query_embedding: Option<&pgvector::Vector>,
+        limit: i64,
+        created_after: Option<chrono::DateTime<Utc>>,
+        created_before: Option<chrono::DateTime<Utc>>,
+        tags: Option<&[String]>,
+    ) -> Result<Vec<crate::search::HybridRawHit>, MemcpError> {
+        // 40 candidates per leg — research recommendation balancing recall vs cost
+        let candidate_limit = 40i64;
+
+        // BM25 leg — always runs (no embedding dependency)
+        let bm25_results = self.search_bm25(query_text, candidate_limit).await?;
+
+        // Vector leg — only runs when query embedding is available (graceful degradation)
+        let vector_results: Vec<(String, i64)> = if let Some(embedding) = query_embedding {
+            let filter = SearchFilter {
+                query_embedding: embedding.clone(),
+                limit: candidate_limit,
+                offset: 0,
+                created_after,
+                created_before,
+                tags: tags.map(|t| t.to_vec()),
+            };
+            let result = self.search_similar(&filter).await?;
+            result
+                .hits
+                .iter()
+                .enumerate()
+                .map(|(i, hit)| (hit.memory.id.clone(), (i + 1) as i64))
+                .collect()
+        } else {
+            tracing::info!("No query embedding available — falling back to BM25-only search");
+            vec![]
+        };
+
+        // RRF fusion with k=60 (research default)
+        let fused = crate::search::rrf_fuse(&bm25_results, &vector_results, 60.0);
+
+        // Fetch full Memory objects for the top fused IDs
+        let top_ids: Vec<String> = fused
+            .iter()
+            .take(limit as usize)
+            .map(|(id, _, _)| id.clone())
+            .collect();
+        let memories = self.get_memories_by_ids(&top_ids).await?;
+
+        // Build HybridRawHit results, preserving RRF rank order
+        let mut hits = Vec::new();
+        for (id, rrf_score, match_source) in fused.iter().take(limit as usize) {
+            if let Some(memory) = memories.get(id) {
+                hits.push(crate::search::HybridRawHit {
+                    memory: memory.clone(),
+                    rrf_score: *rrf_score,
+                    match_source: match_source.clone(),
+                });
+            }
+        }
+
+        Ok(hits)
+    }
+
     /// Search for memories matching the query using BM25 full-text ranking.
     ///
     /// Uses native PostgreSQL tsvector/ts_rank_cd by default. When use_paradedb is true
