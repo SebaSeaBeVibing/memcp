@@ -5,7 +5,9 @@
 /// All CPU-bound fastembed calls are wrapped in spawn_blocking to avoid blocking async runtime.
 
 use async_trait::async_trait;
+use fastembed::{EmbeddingModel, InitOptions, TextEmbedding};
 use std::path::PathBuf;
+use std::sync::{Arc, Mutex};
 use tokio::task;
 
 use super::{EmbeddingError, EmbeddingProvider};
@@ -15,9 +17,7 @@ use super::{EmbeddingError, EmbeddingProvider};
 /// Uses all-MiniLM-L6-v2 model (384 dimensions) as the default.
 /// fastembed is synchronous, so embed() uses spawn_blocking internally.
 pub struct LocalEmbeddingProvider {
-    // Placeholder: fastembed TextEmbedding wrapped in Mutex for thread safety
-    // Will be Arc<std::sync::Mutex<TextEmbedding>> once fastembed is added as dependency
-    _cache_dir: PathBuf,
+    model: Arc<Mutex<TextEmbedding>>,
     name: String,
     dim: usize,
 }
@@ -30,19 +30,19 @@ impl LocalEmbeddingProvider {
     pub async fn new(cache_dir: &str) -> Result<Self, EmbeddingError> {
         let cache_path = PathBuf::from(cache_dir);
 
-        // Ensure cache directory exists
-        task::spawn_blocking({
-            let cache_path = cache_path.clone();
-            move || {
-                std::fs::create_dir_all(&cache_path)
-                    .map_err(|e| EmbeddingError::ModelInit(format!("Failed to create cache dir: {}", e)))
-            }
+        let te = task::spawn_blocking(move || {
+            TextEmbedding::try_new(
+                InitOptions::new(EmbeddingModel::AllMiniLML6V2)
+                    .with_cache_dir(cache_path)
+                    .with_show_download_progress(true),
+            )
         })
         .await
-        .map_err(|e| EmbeddingError::ModelInit(e.to_string()))??;
+        .map_err(|e| EmbeddingError::ModelInit(e.to_string()))?
+        .map_err(|e| EmbeddingError::ModelInit(e.to_string()))?;
 
         Ok(LocalEmbeddingProvider {
-            _cache_dir: cache_path,
+            model: Arc::new(Mutex::new(te)),
             name: "all-MiniLM-L6-v2".to_string(),
             dim: 384,
         })
@@ -51,10 +51,22 @@ impl LocalEmbeddingProvider {
 
 #[async_trait]
 impl EmbeddingProvider for LocalEmbeddingProvider {
-    async fn embed(&self, _text: &str) -> Result<Vec<f32>, EmbeddingError> {
-        // Stub: returns zero vector until fastembed dependency is available
-        // Task 2 will replace this with actual fastembed inference
-        Ok(vec![0.0f32; self.dim])
+    async fn embed(&self, text: &str) -> Result<Vec<f32>, EmbeddingError> {
+        let model = Arc::clone(&self.model);
+        let text = text.to_string();
+
+        task::spawn_blocking(move || {
+            let mut model = model.lock().unwrap();
+            let mut embeddings = model
+                .embed(vec![text], None)
+                .map_err(|e| EmbeddingError::Generation(e.to_string()))?;
+
+            embeddings
+                .pop()
+                .ok_or_else(|| EmbeddingError::Generation("fastembed returned empty result".to_string()))
+        })
+        .await
+        .map_err(|e| EmbeddingError::Generation(format!("spawn_blocking panicked: {}", e)))?
     }
 
     fn model_name(&self) -> &str {
