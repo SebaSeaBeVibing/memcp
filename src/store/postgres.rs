@@ -510,3 +510,176 @@ impl MemoryStore for PostgresMemoryStore {
         Ok(())
     }
 }
+
+impl PostgresMemoryStore {
+    /// Insert a new embedding record for a memory.
+    pub async fn insert_embedding(
+        &self,
+        id: &str,
+        memory_id: &str,
+        model_name: &str,
+        model_version: &str,
+        dimension: i32,
+        embedding: &pgvector::Vector,
+        is_current: bool,
+    ) -> Result<(), MemcpError> {
+        let now = Utc::now();
+        sqlx::query(
+            "INSERT INTO memory_embeddings \
+             (id, memory_id, model_name, model_version, dimension, embedding, is_current, created_at, updated_at) \
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)",
+        )
+        .bind(id)
+        .bind(memory_id)
+        .bind(model_name)
+        .bind(model_version)
+        .bind(dimension)
+        .bind(embedding)
+        .bind(is_current)
+        .bind(&now)
+        .bind(&now)
+        .execute(&self.pool)
+        .await
+        .map_err(|e| MemcpError::Storage(format!("Failed to insert embedding: {}", e)))?;
+
+        Ok(())
+    }
+
+    /// Update the embedding_status field on a memory (internal metadata — does not update updated_at).
+    pub async fn update_embedding_status(
+        &self,
+        memory_id: &str,
+        status: &str,
+    ) -> Result<(), MemcpError> {
+        sqlx::query("UPDATE memories SET embedding_status = $1 WHERE id = $2")
+            .bind(status)
+            .bind(memory_id)
+            .execute(&self.pool)
+            .await
+            .map_err(|e| MemcpError::Storage(format!("Failed to update embedding status: {}", e)))?;
+
+        Ok(())
+    }
+
+    /// Retrieve memories that need embedding (status 'pending' or 'failed'), ordered oldest first.
+    pub async fn get_pending_memories(&self, limit: i64) -> Result<Vec<crate::store::Memory>, MemcpError> {
+        let rows = sqlx::query(
+            "SELECT id, content, type_hint, source, tags, created_at, updated_at, last_accessed_at, access_count, embedding_status \
+             FROM memories WHERE embedding_status IN ('pending', 'failed') \
+             ORDER BY created_at ASC LIMIT $1",
+        )
+        .bind(limit)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|e| MemcpError::Storage(e.to_string()))?;
+
+        rows.iter().map(row_to_memory).collect()
+    }
+
+    /// Return embedding statistics grouped by status and by model.
+    ///
+    /// Returns:
+    /// ```json
+    /// { "by_status": { "pending": N, "complete": N, "failed": N },
+    ///   "by_model": [ { "model_name": ..., "model_version": ..., "is_current": true, "count": N } ] }
+    /// ```
+    pub async fn embedding_stats(&self) -> Result<serde_json::Value, MemcpError> {
+        // Query 1: counts by embedding_status
+        let status_rows = sqlx::query(
+            "SELECT embedding_status, COUNT(*) as count FROM memories GROUP BY embedding_status",
+        )
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|e| MemcpError::Storage(e.to_string()))?;
+
+        let mut by_status = serde_json::Map::new();
+        for row in &status_rows {
+            let status: String = row
+                .try_get("embedding_status")
+                .map_err(|e| MemcpError::Storage(e.to_string()))?;
+            let count: i64 = row
+                .try_get("count")
+                .map_err(|e| MemcpError::Storage(e.to_string()))?;
+            by_status.insert(status, serde_json::json!(count));
+        }
+
+        // Query 2: counts by model
+        let model_rows = sqlx::query(
+            "SELECT model_name, model_version, is_current, COUNT(*) as count \
+             FROM memory_embeddings GROUP BY model_name, model_version, is_current",
+        )
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|e| MemcpError::Storage(e.to_string()))?;
+
+        let mut by_model: Vec<serde_json::Value> = Vec::new();
+        for row in &model_rows {
+            let model_name: String = row
+                .try_get("model_name")
+                .map_err(|e| MemcpError::Storage(e.to_string()))?;
+            let model_version: String = row
+                .try_get("model_version")
+                .map_err(|e| MemcpError::Storage(e.to_string()))?;
+            let is_current: bool = row
+                .try_get("is_current")
+                .map_err(|e| MemcpError::Storage(e.to_string()))?;
+            let count: i64 = row
+                .try_get("count")
+                .map_err(|e| MemcpError::Storage(e.to_string()))?;
+            by_model.push(serde_json::json!({
+                "model_name": model_name,
+                "model_version": model_version,
+                "is_current": is_current,
+                "count": count,
+            }));
+        }
+
+        Ok(serde_json::json!({
+            "by_status": by_status,
+            "by_model": by_model,
+        }))
+    }
+
+    /// Mark ALL current embeddings as stale (used when switching to a new embedding model).
+    ///
+    /// Sets is_current = false on all memory_embeddings, and resets embedding_status = 'pending'
+    /// on all affected memories so the backfill can re-embed them with the new model.
+    /// Returns the count of embeddings marked stale.
+    pub async fn mark_all_embeddings_stale(&self) -> Result<u64, MemcpError> {
+        // Step 1: mark all current embeddings stale and collect affected memory_ids
+        let rows = sqlx::query(
+            "UPDATE memory_embeddings SET is_current = false, updated_at = NOW() \
+             WHERE is_current = true RETURNING memory_id",
+        )
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|e| MemcpError::Storage(format!("Failed to mark embeddings stale: {}", e)))?;
+
+        let count = rows.len() as u64;
+
+        if count > 0 {
+            // Step 2: collect memory_ids and reset their embedding_status to 'pending'
+            let memory_ids: Vec<String> = rows
+                .iter()
+                .filter_map(|r| r.try_get::<String, _>("memory_id").ok())
+                .collect();
+
+            sqlx::query(
+                "UPDATE memories SET embedding_status = 'pending' WHERE id = ANY($1)",
+            )
+            .bind(&memory_ids)
+            .execute(&self.pool)
+            .await
+            .map_err(|e| {
+                MemcpError::Storage(format!("Failed to reset memory embedding_status: {}", e))
+            })?;
+        }
+
+        Ok(count)
+    }
+
+    /// Return the underlying PgPool so embedding pipeline can share the connection pool.
+    pub fn pool(&self) -> &PgPool {
+        &self.pool
+    }
+}

@@ -5,6 +5,7 @@
 
 pub mod local;
 pub mod openai;
+pub mod pipeline;
 
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
@@ -73,6 +74,22 @@ pub struct EmbeddingJob {
     pub text: String,
     /// Current attempt number (for retry logic)
     pub attempt: u8,
+}
+
+/// Concatenate memory content and tags into a single string for embedding.
+/// Tags are appended space-separated after the content.
+pub fn build_embedding_text(content: &str, tags: &Option<serde_json::Value>) -> String {
+    let mut text = content.to_string();
+    if let Some(tags_val) = tags {
+        if let Some(arr) = tags_val.as_array() {
+            let tag_strs: Vec<&str> = arr.iter().filter_map(|v| v.as_str()).collect();
+            if !tag_strs.is_empty() {
+                text.push(' ');
+                text.push_str(&tag_strs.join(" "));
+            }
+        }
+    }
+    text
 }
 
 /// Core trait for embedding text into fixed-dimension float vectors.

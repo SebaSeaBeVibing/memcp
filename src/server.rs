@@ -17,18 +17,24 @@ use std::sync::Arc;
 use std::time::Instant;
 use chrono::DateTime;
 
+use crate::embedding::EmbeddingJob;
 use crate::errors::MemcpError;
 use crate::store::{CreateMemory, ListFilter, Memory, MemoryStore, UpdateMemory};
 
 pub struct MemoryService {
     store: Arc<dyn MemoryStore + Send + Sync>,
+    pipeline: Option<crate::embedding::pipeline::EmbeddingPipeline>,
     start_time: Instant,
 }
 
 impl MemoryService {
-    pub fn new(store: Arc<dyn MemoryStore + Send + Sync>) -> Self {
+    pub fn new(
+        store: Arc<dyn MemoryStore + Send + Sync>,
+        pipeline: Option<crate::embedding::pipeline::EmbeddingPipeline>,
+    ) -> Self {
         Self {
             store,
+            pipeline,
             start_time: Instant::now(),
         }
     }
@@ -204,17 +210,29 @@ impl MemoryService {
         };
 
         match self.store.store(input).await {
-            Ok(memory) => Ok(CallToolResult::structured(json!({
-                "id": memory.id,
-                "content": memory.content,
-                "type_hint": memory.type_hint,
-                "source": memory.source,
-                "tags": memory.tags,
-                "created_at": memory.created_at.to_rfc3339(),
-                "updated_at": memory.updated_at.to_rfc3339(),
-                "access_count": memory.access_count,
-                "hint": "Use get_memory with this ID to retrieve, or update_memory to modify"
-            }))),
+            Ok(memory) => {
+                // Enqueue background embedding job (non-blocking)
+                if let Some(ref pipeline) = self.pipeline {
+                    let text = crate::embedding::build_embedding_text(&memory.content, &memory.tags);
+                    pipeline.enqueue(EmbeddingJob {
+                        memory_id: memory.id.clone(),
+                        text,
+                        attempt: 0,
+                    });
+                }
+                Ok(CallToolResult::structured(json!({
+                    "id": memory.id,
+                    "content": memory.content,
+                    "type_hint": memory.type_hint,
+                    "source": memory.source,
+                    "tags": memory.tags,
+                    "created_at": memory.created_at.to_rfc3339(),
+                    "updated_at": memory.updated_at.to_rfc3339(),
+                    "access_count": memory.access_count,
+                    "embedding_status": memory.embedding_status,
+                    "hint": "Use get_memory with this ID to retrieve, or update_memory to modify"
+                })))
+            }
             Err(e) => Ok(store_error_to_result(e)),
         }
     }
@@ -249,6 +267,7 @@ impl MemoryService {
                 "updated_at": memory.updated_at.to_rfc3339(),
                 "last_accessed_at": memory.last_accessed_at.map(|dt| dt.to_rfc3339()),
                 "access_count": memory.access_count,
+                "embedding_status": memory.embedding_status,
                 "hint": "Use update_memory to modify or delete_memory to remove"
             }))),
             Err(e) => Ok(store_error_to_result(e)),
@@ -289,6 +308,10 @@ impl MemoryService {
             })));
         }
 
+        // Track if content or tags changed — determines if re-embedding is needed
+        let content_changed = params.content.is_some();
+        let tags_changed = params.tags.is_some();
+
         let input = UpdateMemory {
             content: params.content,
             type_hint: params.type_hint,
@@ -297,17 +320,31 @@ impl MemoryService {
         };
 
         match self.store.update(&params.id, input).await {
-            Ok(memory) => Ok(CallToolResult::structured(json!({
-                "id": memory.id,
-                "content": memory.content,
-                "type_hint": memory.type_hint,
-                "source": memory.source,
-                "tags": memory.tags,
-                "created_at": memory.created_at.to_rfc3339(),
-                "updated_at": memory.updated_at.to_rfc3339(),
-                "access_count": memory.access_count,
-                "hint": "Use get_memory to re-read or delete_memory to remove"
-            }))),
+            Ok(memory) => {
+                // Re-embed when content or tags change (tags are part of the embedding text)
+                if content_changed || tags_changed {
+                    if let Some(ref pipeline) = self.pipeline {
+                        let text = crate::embedding::build_embedding_text(&memory.content, &memory.tags);
+                        pipeline.enqueue(EmbeddingJob {
+                            memory_id: memory.id.clone(),
+                            text,
+                            attempt: 0,
+                        });
+                    }
+                }
+                Ok(CallToolResult::structured(json!({
+                    "id": memory.id,
+                    "content": memory.content,
+                    "type_hint": memory.type_hint,
+                    "source": memory.source,
+                    "tags": memory.tags,
+                    "created_at": memory.created_at.to_rfc3339(),
+                    "updated_at": memory.updated_at.to_rfc3339(),
+                    "access_count": memory.access_count,
+                    "embedding_status": memory.embedding_status,
+                    "hint": "Use get_memory to re-read or delete_memory to remove"
+                })))
+            }
             Err(e) => Ok(store_error_to_result(e)),
         }
     }
@@ -501,6 +538,7 @@ impl MemoryService {
                             "created_at": m.created_at.to_rfc3339(),
                             "updated_at": m.updated_at.to_rfc3339(),
                             "access_count": m.access_count,
+                            "embedding_status": m.embedding_status,
                         })
                     })
                     .collect();
