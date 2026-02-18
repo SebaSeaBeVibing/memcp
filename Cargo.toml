@@ -21,3 +21,5 @@ sqlx = { version = "0.8", features = ["runtime-tokio", "postgres", "chrono", "uu
 clap = { version = "4", features = ["derive"] }
 async-trait = "0.1"
 base64 = "0.22"
+dirs = "6"
+reqwest = { version = "0.12", features = ["json"] }

@@ -32,6 +32,12 @@ impl From<sqlx::Error> for MemcpError {
     }
 }
 
+impl From<crate::embedding::EmbeddingError> for MemcpError {
+    fn from(e: crate::embedding::EmbeddingError) -> Self {
+        MemcpError::Internal(e.to_string())
+    }
+}
+
 impl MemcpError {
     /// Helper to create validation errors with field names
     ///

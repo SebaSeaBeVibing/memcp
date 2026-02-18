@@ -32,6 +32,9 @@ pub struct Memory {
     pub last_accessed_at: Option<DateTime<Utc>>,
     /// Number of times memory has been retrieved
     pub access_count: i64,
+    /// Embedding generation status: "pending", "complete", or "failed"
+    /// Use EmbeddingStatus enum (in embedding module) for type-safe pipeline logic.
+    pub embedding_status: String,
 }
 
 /// Input type for creating a new memory.

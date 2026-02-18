@@ -13,6 +13,49 @@ use figment::{
 use serde::{Deserialize, Serialize};
 use crate::errors::MemcpError;
 
+/// Configuration for the embedding provider subsystem.
+///
+/// Provider selection is explicit — having an API key does NOT auto-switch from local.
+/// Nested env var overrides use double underscores:
+///   MEMCP_EMBEDDING__PROVIDER=openai
+///   MEMCP_EMBEDDING__OPENAI_API_KEY=sk-...
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct EmbeddingConfig {
+    /// Which provider to use: "local" (fastembed) or "openai"
+    /// Default: "local" — no API key required for self-hosted deployments
+    #[serde(default = "default_embedding_provider")]
+    pub provider: String,
+
+    /// OpenAI API key — only required when provider = "openai"
+    #[serde(default)]
+    pub openai_api_key: Option<String>,
+
+    /// Directory for caching model weights (fastembed downloads)
+    /// Default: platform cache dir + "/memcp/models", fallback to /tmp/memcp_models
+    #[serde(default = "default_cache_dir")]
+    pub cache_dir: String,
+}
+
+fn default_embedding_provider() -> String {
+    "local".to_string()
+}
+
+fn default_cache_dir() -> String {
+    dirs::cache_dir()
+        .map(|p| p.join("memcp").join("models").to_string_lossy().into_owned())
+        .unwrap_or_else(|| "/tmp/memcp_models".to_string())
+}
+
+impl Default for EmbeddingConfig {
+    fn default() -> Self {
+        EmbeddingConfig {
+            provider: default_embedding_provider(),
+            openai_api_key: None,
+            cache_dir: default_cache_dir(),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Config {
     /// Log level: trace, debug, info, warn, error
@@ -27,6 +70,11 @@ pub struct Config {
     /// Configurable via DATABASE_URL or MEMCP_DATABASE_URL env var, or database_url in memcp.toml.
     #[serde(default = "default_database_url")]
     pub database_url: String,
+
+    /// Embedding provider configuration.
+    /// Existing configs without [embedding] section still work (serde default applied).
+    #[serde(default)]
+    pub embedding: EmbeddingConfig,
 }
 
 fn default_log_level() -> String {
@@ -43,6 +91,7 @@ impl Default for Config {
             log_level: default_log_level(),
             log_file: None,
             database_url: default_database_url(),
+            embedding: EmbeddingConfig::default(),
         }
     }
 }
@@ -60,6 +109,7 @@ impl Config {
             // Standard DATABASE_URL env var (highest priority for database config)
             .merge(Env::raw().only(&["DATABASE_URL"]).map(|_| "database_url".into()))
             // MEMCP_-prefixed env vars (includes MEMCP_DATABASE_URL, MEMCP_LOG_LEVEL, etc.)
+            // Double underscore handles nested: MEMCP_EMBEDDING__PROVIDER=openai
             .merge(Env::prefixed("MEMCP_"))
             .extract()
             .map_err(|e| MemcpError::Config(format!("Failed to load config: {}", e)))
@@ -76,5 +126,7 @@ mod tests {
         assert_eq!(config.log_level, "info");
         assert_eq!(config.log_file, None);
         assert_eq!(config.database_url, "postgres://memcp:memcp@localhost:5432/memcp");
+        assert_eq!(config.embedding.provider, "local");
+        assert_eq!(config.embedding.openai_api_key, None);
     }
 }

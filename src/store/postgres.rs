@@ -99,6 +99,7 @@ fn row_to_memory(row: &PgRow) -> Result<Memory, MemcpError> {
         updated_at: row.try_get("updated_at").map_err(|e| MemcpError::Storage(e.to_string()))?,
         last_accessed_at: row.try_get("last_accessed_at").map_err(|e| MemcpError::Storage(e.to_string()))?,
         access_count: row.try_get("access_count").map_err(|e| MemcpError::Storage(e.to_string()))?,
+        embedding_status: row.try_get("embedding_status").map_err(|e| MemcpError::Storage(e.to_string()))?,
     })
 }
 
@@ -115,8 +116,8 @@ impl MemoryStore for PostgresMemoryStore {
             .map(|t| serde_json::json!(t));
 
         sqlx::query(
-            "INSERT INTO memories (id, content, type_hint, source, tags, created_at, updated_at, access_count) \
-             VALUES ($1, $2, $3, $4, $5, $6, $7, 0)",
+            "INSERT INTO memories (id, content, type_hint, source, tags, created_at, updated_at, access_count, embedding_status) \
+             VALUES ($1, $2, $3, $4, $5, $6, $7, 0, 'pending')",
         )
         .bind(&id)
         .bind(&input.content)
@@ -139,12 +140,13 @@ impl MemoryStore for PostgresMemoryStore {
             updated_at: now,
             last_accessed_at: None,
             access_count: 0,
+            embedding_status: "pending".to_string(),
         })
     }
 
     async fn get(&self, id: &str) -> Result<Memory, MemcpError> {
         let row = sqlx::query(
-            "SELECT id, content, type_hint, source, tags, created_at, updated_at, last_accessed_at, access_count \
+            "SELECT id, content, type_hint, source, tags, created_at, updated_at, last_accessed_at, access_count, embedding_status \
              FROM memories WHERE id = $1",
         )
         .bind(id)
@@ -229,7 +231,7 @@ impl MemoryStore for PostgresMemoryStore {
 
         // Re-fetch and return the updated record
         let updated_row = sqlx::query(
-            "SELECT id, content, type_hint, source, tags, created_at, updated_at, last_accessed_at, access_count \
+            "SELECT id, content, type_hint, source, tags, created_at, updated_at, last_accessed_at, access_count, embedding_status \
              FROM memories WHERE id = $1",
         )
         .bind(id)
@@ -306,7 +308,7 @@ impl MemoryStore for PostgresMemoryStore {
         };
 
         let sql = format!(
-            "SELECT id, content, type_hint, source, tags, created_at, updated_at, last_accessed_at, access_count \
+            "SELECT id, content, type_hint, source, tags, created_at, updated_at, last_accessed_at, access_count, embedding_status \
              FROM memories {} ORDER BY created_at DESC, id ASC LIMIT ${}",
             where_clause, param_idx
         );
