@@ -137,6 +137,19 @@ pub struct ListMemoriesParams {
 }
 
 #[derive(Debug, Deserialize, Serialize, JsonSchema)]
+pub struct ReinforceMemoryParams {
+    /// Memory ID to reinforce (required)
+    pub id: String,
+    /// Reinforcement strength: "good" (default) for standard reinforcement, "easy" for stronger boost
+    #[serde(default = "default_rating")]
+    pub rating: Option<String>,
+}
+
+fn default_rating() -> Option<String> {
+    Some("good".to_string())
+}
+
+#[derive(Debug, Deserialize, Serialize, JsonSchema)]
 pub struct SearchMemoryParams {
     /// Natural language query — find memories by meaning, not exact words (required)
     pub query: String,
@@ -278,19 +291,31 @@ impl MemoryService {
         }
 
         match self.store.get(&params.id).await {
-            Ok(memory) => Ok(CallToolResult::structured(json!({
-                "id": memory.id,
-                "content": memory.content,
-                "type_hint": memory.type_hint,
-                "source": memory.source,
-                "tags": memory.tags,
-                "created_at": memory.created_at.to_rfc3339(),
-                "updated_at": memory.updated_at.to_rfc3339(),
-                "last_accessed_at": memory.last_accessed_at.map(|dt| dt.to_rfc3339()),
-                "access_count": memory.access_count,
-                "embedding_status": memory.embedding_status,
-                "hint": "Use update_memory to modify or delete_memory to remove"
-            }))),
+            Ok(memory) => {
+                // Implicit salience bump on direct retrieval (fire-and-forget, not on search results)
+                if let Some(ref pg_store) = self.pg_store {
+                    let store = pg_store.clone();
+                    let id = params.id.clone();
+                    tokio::spawn(async move {
+                        if let Err(e) = store.touch_salience(&id).await {
+                            tracing::warn!("Failed to touch salience for {}: {}", id, e);
+                        }
+                    });
+                }
+                Ok(CallToolResult::structured(json!({
+                    "id": memory.id,
+                    "content": memory.content,
+                    "type_hint": memory.type_hint,
+                    "source": memory.source,
+                    "tags": memory.tags,
+                    "created_at": memory.created_at.to_rfc3339(),
+                    "updated_at": memory.updated_at.to_rfc3339(),
+                    "last_accessed_at": memory.last_accessed_at.map(|dt| dt.to_rfc3339()),
+                    "access_count": memory.access_count,
+                    "embedding_status": memory.embedding_status,
+                    "hint": "Use update_memory to modify or delete_memory to remove"
+                })))
+            }
             Err(e) => Ok(store_error_to_result(e)),
         }
     }
@@ -751,6 +776,68 @@ impl MemoryService {
         Ok(CallToolResult::structured(response))
     }
 
+    #[tool(description = "Reinforce a memory to boost its salience in future searches. Use when a memory is particularly relevant or important. Reinforcing a faded memory produces a stronger boost than reinforcing a recently accessed one (spaced repetition). Rating: 'good' (default) for standard reinforcement, 'easy' for extra-strong boost.")]
+    async fn reinforce_memory(
+        &self,
+        Parameters(params): Parameters<ReinforceMemoryParams>,
+    ) -> Result<CallToolResult, McpError> {
+        tracing::info!(
+            tool = "reinforce_memory",
+            id = %params.id,
+            rating = ?params.rating,
+            "Tool called"
+        );
+
+        if params.id.trim().is_empty() {
+            return Ok(CallToolResult::structured_error(json!({
+                "isError": true,
+                "error": "Field 'id' is required and cannot be empty",
+                "field": "id"
+            })));
+        }
+
+        // Verify memory exists
+        match self.store.get(&params.id).await {
+            Err(MemcpError::NotFound { .. }) => {
+                return Ok(CallToolResult::structured_error(json!({
+                    "isError": true,
+                    "error": format!("Memory not found: {}", params.id),
+                    "hint": "Use list_memories to find available memory IDs"
+                })));
+            }
+            Err(e) => return Ok(store_error_to_result(e)),
+            Ok(_) => {}
+        }
+
+        // Validate and normalize rating
+        let rating = params.rating.as_deref().unwrap_or("good");
+        let rating = if rating == "easy" { "easy" } else { "good" };
+
+        // Get concrete pg_store reference
+        let pg_store = match &self.pg_store {
+            Some(s) => s,
+            None => {
+                return Ok(CallToolResult::structured_error(json!({
+                    "isError": true,
+                    "error": "Reinforcement requires PostgreSQL backend"
+                })));
+            }
+        };
+
+        match pg_store.reinforce_salience(&params.id, rating).await {
+            Ok(row) => Ok(CallToolResult::structured(json!({
+                "id": params.id,
+                "stability": row.stability,
+                "reinforcement_count": row.reinforcement_count,
+                "message": format!(
+                    "Memory reinforced. Stability: {:.1} days, reinforcements: {}",
+                    row.stability, row.reinforcement_count
+                )
+            }))),
+            Err(e) => Ok(store_error_to_result(e)),
+        }
+    }
+
     #[tool(description = "Check server health and status")]
     async fn health_check(
         &self,
@@ -807,7 +894,7 @@ impl ServerHandler for MemoryService {
                 website_url: None,
             },
             instructions: Some(
-                "Memory server for AI agents. Tools: store_memory, get_memory, search_memory, update_memory, delete_memory, bulk_delete_memories, list_memories, health_check. Resources: memory://session-primer (recent memories), memory://user-profile (preferences).".to_string()
+                "Memory server for AI agents. Tools: store_memory, get_memory, search_memory, update_memory, delete_memory, bulk_delete_memories, list_memories, health_check, reinforce_memory. Resources: memory://session-primer (recent memories), memory://user-profile (preferences).".to_string()
             ),
         }
     }
