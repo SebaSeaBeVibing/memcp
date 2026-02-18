@@ -17,13 +17,15 @@ use std::sync::Arc;
 use std::time::Instant;
 use chrono::DateTime;
 
-use crate::embedding::EmbeddingJob;
+use crate::embedding::{EmbeddingJob, EmbeddingProvider};
 use crate::errors::MemcpError;
-use crate::store::{CreateMemory, ListFilter, Memory, MemoryStore, UpdateMemory};
+use crate::store::{CreateMemory, ListFilter, Memory, MemoryStore, SearchFilter, UpdateMemory, decode_search_cursor};
 
 pub struct MemoryService {
     store: Arc<dyn MemoryStore + Send + Sync>,
     pipeline: Option<crate::embedding::pipeline::EmbeddingPipeline>,
+    embedding_provider: Option<Arc<dyn EmbeddingProvider>>,
+    pg_store: Option<Arc<crate::store::postgres::PostgresMemoryStore>>,
     start_time: Instant,
 }
 
@@ -31,10 +33,14 @@ impl MemoryService {
     pub fn new(
         store: Arc<dyn MemoryStore + Send + Sync>,
         pipeline: Option<crate::embedding::pipeline::EmbeddingPipeline>,
+        embedding_provider: Option<Arc<dyn EmbeddingProvider>>,
+        pg_store: Option<Arc<crate::store::postgres::PostgresMemoryStore>>,
     ) -> Self {
         Self {
             store,
             pipeline,
+            embedding_provider,
+            pg_store,
             start_time: Instant::now(),
         }
     }
@@ -125,10 +131,18 @@ pub struct ListMemoriesParams {
 
 #[derive(Debug, Deserialize, Serialize, JsonSchema)]
 pub struct SearchMemoryParams {
-    /// Natural language search query (required)
+    /// Natural language query — find memories by meaning, not exact words (required)
     pub query: String,
-    /// Maximum number of results to return (1-100, default: 10)
+    /// Maximum results to return (1-100, default: 10)
     pub limit: Option<u32>,
+    /// Return only memories created after this ISO-8601 timestamp (optional)
+    pub created_after: Option<String>,
+    /// Return only memories created before this ISO-8601 timestamp (optional)
+    pub created_before: Option<String>,
+    /// Filter by tags — return only memories with ALL specified tags (optional)
+    pub tags: Option<Vec<String>>,
+    /// Cursor from previous page for pagination (optional)
+    pub cursor: Option<String>,
 }
 
 // Helper: convert MemcpError to CallToolResult with isError: true

@@ -161,6 +161,7 @@ async fn main() -> Result<()> {
             // 6. Create embedding provider and pipeline
             let provider = create_embedding_provider(&config).await
                 .expect("Failed to initialize embedding provider");
+            let provider_for_search = provider.clone();  // Clone for MemoryService search
             let pipeline = EmbeddingPipeline::new(provider, store.clone(), 1000);
 
             // 7. Run startup backfill — queue any un-embedded memories from previous runs
@@ -169,10 +170,13 @@ async fn main() -> Result<()> {
                 tracing::info!(count = queued, "Startup backfill queued memories for embedding");
             }
 
-            // 8. Create service with store and pipeline
+            // 8. Create service with store, pipeline, and embedding provider for search
+            let pg_store_for_search = store.clone();
             let service = MemoryService::new(
                 store as Arc<dyn memcp::store::MemoryStore + Send + Sync>,
                 Some(pipeline),
+                Some(provider_for_search),
+                Some(pg_store_for_search),
             );
 
             // 9. Serve via stdio transport
