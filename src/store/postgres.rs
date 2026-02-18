@@ -14,6 +14,7 @@ use std::collections::HashMap;
 use std::time::Duration;
 use uuid::Uuid;
 
+use crate::config::SearchConfig;
 use crate::errors::MemcpError;
 use crate::store::{
     encode_search_cursor, CreateMemory, ListFilter, ListResult, Memory, MemoryStore,
@@ -45,6 +46,11 @@ impl Default for SalienceRow {
 /// PostgreSQL-backed memory store using sqlx connection pool.
 pub struct PostgresMemoryStore {
     pool: PgPool,
+    /// Whether the ParadeDB pg_search extension is installed on this PostgreSQL instance.
+    /// Detected once at construction time via pg_extension catalog query.
+    paradedb_available: bool,
+    /// Whether to use ParadeDB for BM25 search (paradedb_available AND config says "paradedb").
+    use_paradedb: bool,
 }
 
 impl PostgresMemoryStore {
@@ -52,7 +58,19 @@ impl PostgresMemoryStore {
     ///
     /// Configures a production-ready connection pool with sensible defaults.
     /// If run_migrations is true, automatically runs pending migrations on startup.
+    /// Detects ParadeDB pg_search extension at startup and caches result.
     pub async fn new(database_url: &str, run_migrations: bool) -> Result<Self, MemcpError> {
+        Self::new_with_search_config(database_url, run_migrations, &SearchConfig::default()).await
+    }
+
+    /// Create a new PostgresMemoryStore with an explicit SearchConfig.
+    ///
+    /// Allows operators to set bm25_backend via config or env var.
+    pub async fn new_with_search_config(
+        database_url: &str,
+        run_migrations: bool,
+        search_config: &SearchConfig,
+    ) -> Result<Self, MemcpError> {
         let pool = PgPoolOptions::new()
             .max_connections(10)         // good default for single-server MCP stdio
             .min_connections(1)          // keep at least one warm connection
@@ -69,7 +87,43 @@ impl PostgresMemoryStore {
                 .map_err(|e| MemcpError::Storage(format!("Migration failed: {}", e)))?;
         }
 
-        Ok(PostgresMemoryStore { pool })
+        // Detect ParadeDB at startup — cached as bool for the lifetime of the store
+        let paradedb_available = Self::detect_paradedb(&pool).await;
+
+        // Determine effective BM25 backend:
+        // - "paradedb" config + available → use ParadeDB
+        // - "paradedb" config + NOT available → warn, fall back to native
+        // - "native" config (default) → always use native
+        let use_paradedb = if search_config.bm25_backend == "paradedb" {
+            if paradedb_available {
+                tracing::info!("ParadeDB pg_search extension detected — using ParadeDB for BM25");
+                true
+            } else {
+                tracing::warn!(
+                    "bm25_backend=paradedb configured but pg_search extension not found — falling back to native PostgreSQL tsvector"
+                );
+                false
+            }
+        } else {
+            if paradedb_available {
+                tracing::info!("ParadeDB pg_search extension detected — using native PostgreSQL tsvector for BM25 (set bm25_backend=paradedb to opt in)");
+            } else {
+                tracing::info!("Using native PostgreSQL tsvector for BM25");
+            }
+            false
+        };
+
+        Ok(PostgresMemoryStore { pool, paradedb_available, use_paradedb })
+    }
+
+    /// Detect whether the ParadeDB pg_search extension is installed on this PostgreSQL instance.
+    ///
+    /// Queries the pg_extension catalog once at startup. Returns true if pg_search is present.
+    async fn detect_paradedb(pool: &PgPool) -> bool {
+        sqlx::query("SELECT 1 FROM pg_extension WHERE extname = 'pg_search' LIMIT 1")
+            .fetch_optional(pool)
+            .await
+            .is_ok_and(|r| r.is_some())
     }
 }
 
@@ -709,6 +763,12 @@ impl PostgresMemoryStore {
         &self.pool
     }
 
+    /// Returns whether the ParadeDB pg_search extension is available on this PostgreSQL instance.
+    /// Detected once at construction time — cached for the lifetime of the store.
+    pub fn paradedb_available(&self) -> bool {
+        self.paradedb_available
+    }
+
     /// Fetch salience rows for a batch of memory IDs from memory_salience table.
     ///
     /// Returns defaults (stability=1.0, difficulty=5.0, count=0) for IDs with no row.
@@ -957,5 +1017,57 @@ impl PostgresMemoryStore {
             next_cursor,
             has_more,
         })
+    }
+
+    /// Search for memories matching the query using BM25 full-text ranking.
+    ///
+    /// Uses native PostgreSQL tsvector/ts_rank_cd by default. When use_paradedb is true
+    /// (ParadeDB available AND bm25_backend=paradedb configured), uses pg_search extension
+    /// for true BM25 scoring.
+    ///
+    /// Returns (memory_id, bm25_rank) pairs ordered by relevance. Rank is a 1-based position
+    /// (lower = more relevant) for the native path; same semantics for ParadeDB path.
+    pub async fn search_bm25(
+        &self,
+        query: &str,
+        limit: i64,
+    ) -> Result<Vec<(String, i64)>, MemcpError> {
+        let sql = if self.use_paradedb {
+            // ParadeDB path: true BM25 scoring via pg_search extension
+            // Uses ParadeDB's @@@ operator and paradedb.score() function for BM25 ranking
+            "SELECT id, ROW_NUMBER() OVER (
+                ORDER BY paradedb.score(id) DESC
+            ) AS bm25_rank
+            FROM memories
+            WHERE content @@@ $1
+            ORDER BY bm25_rank
+            LIMIT $2"
+        } else {
+            // Native PostgreSQL tsvector path — uses GIN index from migration 004
+            // ts_rank_cd uses cover density ranking; ORDER BY bm25_rank for result order
+            "SELECT id, ROW_NUMBER() OVER (
+                ORDER BY ts_rank_cd(
+                    to_tsvector('english', content),
+                    plainto_tsquery('english', $1)
+                ) DESC
+            ) AS bm25_rank
+            FROM memories
+            WHERE to_tsvector('english', content) @@ plainto_tsquery('english', $1)
+            ORDER BY bm25_rank
+            LIMIT $2"
+        };
+
+        let rows = sqlx::query(sql)
+            .bind(query)
+            .bind(limit)
+            .fetch_all(&self.pool)
+            .await
+            .map_err(|e| MemcpError::Storage(format!("BM25 search failed: {}", e)))?;
+
+        rows.iter().map(|row| {
+            let id: String = row.try_get("id").map_err(|e| MemcpError::Storage(e.to_string()))?;
+            let rank: i64 = row.try_get("bm25_rank").map_err(|e| MemcpError::Storage(e.to_string()))?;
+            Ok((id, rank))
+        }).collect::<Result<Vec<_>, MemcpError>>()
     }
 }
