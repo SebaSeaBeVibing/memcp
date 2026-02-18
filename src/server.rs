@@ -572,7 +572,7 @@ impl MemoryService {
         }
     }
 
-    #[tool(description = "Search is not yet implemented. Currently returns sample results. Full semantic search coming in a future update. Use list_memories to browse all memories.")]
+    #[tool(description = "Search memories by meaning using semantic similarity. Use this tool when you want to find memories related to a concept, topic, or question — it matches by meaning, not exact words. Returns results ranked by relevance with similarity scores (0.0-1.0). For browsing all memories or filtering by type/source, use list_memories instead.")]
     async fn search_memory(
         &self,
         Parameters(params): Parameters<SearchMemoryParams>,
@@ -581,9 +581,11 @@ impl MemoryService {
             tool = "search_memory",
             query = %params.query,
             limit = ?params.limit,
-            "Tool called (stub)"
+            has_cursor = params.cursor.is_some(),
+            "Tool called"
         );
 
+        // 1. Validate query
         if params.query.trim().is_empty() {
             return Ok(CallToolResult::structured_error(json!({
                 "isError": true,
@@ -592,17 +594,126 @@ impl MemoryService {
             })));
         }
 
+        // 2. Validate limit
         let limit = params.limit.unwrap_or(10).clamp(1, 100);
 
-        // Stub response - search not yet implemented
-        Ok(CallToolResult::structured(json!({
-            "results": [],
-            "count": 0,
+        // 3. Check embedding provider
+        let provider = match &self.embedding_provider {
+            Some(p) => p,
+            None => {
+                return Ok(CallToolResult::structured_error(json!({
+                    "isError": true,
+                    "error": "Search is not available: embedding provider not configured",
+                    "hint": "Use list_memories to browse memories"
+                })));
+            }
+        };
+
+        // 4. Embed the query
+        let query_vec = match provider.embed(&params.query).await {
+            Ok(vec) => vec,
+            Err(e) => {
+                return Ok(CallToolResult::structured_error(json!({
+                    "isError": true,
+                    "error": format!("Failed to embed search query: {}", e),
+                    "hint": "Try a simpler query or check embedding provider status"
+                })));
+            }
+        };
+
+        // 5. Parse optional datetime params
+        let created_after = if let Some(ref s) = params.created_after {
+            match parse_datetime(s, "created_after") {
+                Ok(dt) => Some(dt),
+                Err(result) => return Ok(result),
+            }
+        } else {
+            None
+        };
+
+        let created_before = if let Some(ref s) = params.created_before {
+            match parse_datetime(s, "created_before") {
+                Ok(dt) => Some(dt),
+                Err(result) => return Ok(result),
+            }
+        } else {
+            None
+        };
+
+        // 6. Decode cursor to offset
+        let offset = if let Some(ref cursor) = params.cursor {
+            match decode_search_cursor(cursor) {
+                Ok(off) => off,
+                Err(e) => {
+                    return Ok(store_error_to_result(e));
+                }
+            }
+        } else {
+            0
+        };
+
+        // 7. Build SearchFilter
+        let filter = SearchFilter {
+            query_embedding: pgvector::Vector::from(query_vec),
+            limit: limit as i64,
+            offset,
+            created_after,
+            created_before,
+            tags: params.tags,
+        };
+
+        // 8. Get concrete PostgresMemoryStore reference
+        let pg_store = match &self.pg_store {
+            Some(s) => s,
+            None => {
+                return Ok(CallToolResult::structured_error(json!({
+                    "isError": true,
+                    "error": "Search requires PostgreSQL backend",
+                    "hint": "Use list_memories to browse memories"
+                })));
+            }
+        };
+
+        // 9. Call search_similar and handle errors
+        let search_result = match pg_store.search_similar(&filter).await {
+            Ok(r) => r,
+            Err(e) => return Ok(store_error_to_result(e)),
+        };
+
+        // 10. Format results
+        let results: Vec<serde_json::Value> = search_result.hits.iter().map(|hit| {
+            json!({
+                "id": hit.memory.id,
+                "content": hit.memory.content,
+                "similarity": (hit.similarity * 1000.0).round() / 1000.0,
+                "type_hint": hit.memory.type_hint,
+                "source": hit.memory.source,
+                "tags": hit.memory.tags,
+                "created_at": hit.memory.created_at.to_rfc3339(),
+                "updated_at": hit.memory.updated_at.to_rfc3339(),
+                "access_count": hit.memory.access_count,
+            })
+        }).collect();
+
+        let count = results.len();
+
+        // 11. Build final response JSON
+        let mut response = json!({
+            "results": results,
+            "count": count,
+            "total_matches": search_result.total_matches,
             "query": params.query,
-            "limit": limit,
-            "note": "Search is not yet implemented. Full semantic search coming in a future update.",
-            "hint": "Use list_memories to browse all memories, or get_memory to retrieve by ID"
-        })))
+            "next_cursor": search_result.next_cursor,
+            "has_more": search_result.has_more,
+        });
+
+        if count == 0 {
+            response["hint"] = json!("No memories matched your query. Try broader search terms or use list_memories to browse all memories.");
+        } else if search_result.has_more {
+            response["hint"] = json!("Use next_cursor with cursor parameter to get the next page");
+        }
+
+        Ok(CallToolResult::structured(response))
     }
 
     #[tool(description = "Check server health and status")]
@@ -656,7 +767,7 @@ impl ServerHandler for MemoryService {
                 name: "memcp".to_string(),
                 title: None,
                 version: env!("CARGO_PKG_VERSION").to_string(),
-                description: Some("High-performance MCP memory server with persistent SQLite storage".to_string()),
+                description: Some("High-performance MCP memory server with persistent PostgreSQL storage with semantic search".to_string()),
                 icons: None,
                 website_url: None,
             },
