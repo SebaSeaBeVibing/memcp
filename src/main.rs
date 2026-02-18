@@ -170,13 +170,14 @@ async fn main() -> Result<()> {
                 tracing::info!(count = queued, "Startup backfill queued memories for embedding");
             }
 
-            // 8. Create service with store, pipeline, and embedding provider for search
+            // 8. Create service with store, pipeline, embedding provider, and salience config
             let pg_store_for_search = store.clone();
             let service = MemoryService::new(
                 store as Arc<dyn memcp::store::MemoryStore + Send + Sync>,
                 Some(pipeline),
                 Some(provider_for_search),
                 Some(pg_store_for_search),
+                config.salience.clone(),
             );
 
             // 9. Serve via stdio transport

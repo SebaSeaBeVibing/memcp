@@ -16,16 +16,21 @@ use serde_json::json;
 use std::sync::Arc;
 use std::time::Instant;
 use chrono::DateTime;
+use chrono::Utc;
 
+use crate::config::SalienceConfig;
 use crate::embedding::{EmbeddingJob, EmbeddingProvider};
 use crate::errors::MemcpError;
-use crate::store::{CreateMemory, ListFilter, Memory, MemoryStore, SearchFilter, UpdateMemory, decode_search_cursor};
+use crate::search::{SalienceScorer, ScoredHit};
+use crate::search::salience::SalienceInput;
+use crate::store::{CreateMemory, ListFilter, Memory, MemoryStore, UpdateMemory};
 
 pub struct MemoryService {
     store: Arc<dyn MemoryStore + Send + Sync>,
     pipeline: Option<crate::embedding::pipeline::EmbeddingPipeline>,
     embedding_provider: Option<Arc<dyn EmbeddingProvider>>,
     pg_store: Option<Arc<crate::store::postgres::PostgresMemoryStore>>,
+    salience_config: SalienceConfig,
     start_time: Instant,
 }
 
@@ -35,12 +40,14 @@ impl MemoryService {
         pipeline: Option<crate::embedding::pipeline::EmbeddingPipeline>,
         embedding_provider: Option<Arc<dyn EmbeddingProvider>>,
         pg_store: Option<Arc<crate::store::postgres::PostgresMemoryStore>>,
+        salience_config: SalienceConfig,
     ) -> Self {
         Self {
             store,
             pipeline,
             embedding_provider,
             pg_store,
+            salience_config,
             start_time: Instant::now(),
         }
     }
@@ -572,7 +579,7 @@ impl MemoryService {
         }
     }
 
-    #[tool(description = "Search memories by meaning using semantic similarity. Use this tool when you want to find memories related to a concept, topic, or question — it matches by meaning, not exact words. Returns results ranked by relevance with similarity scores (0.0-1.0). For browsing all memories or filtering by type/source, use list_memories instead.")]
+    #[tool(description = "Search memories using both keyword matching and semantic similarity for best results. Use this when you want to find memories related to a concept, topic, or question. Results are ranked by salience score combining recency, access frequency, semantic relevance, and reinforcement. For browsing all memories or filtering by type/source, use list_memories instead.")]
     async fn search_memory(
         &self,
         Parameters(params): Parameters<SearchMemoryParams>,
@@ -597,28 +604,29 @@ impl MemoryService {
         // 2. Validate limit
         let limit = params.limit.unwrap_or(10).clamp(1, 100);
 
-        // 3. Check embedding provider
-        let provider = match &self.embedding_provider {
-            Some(p) => p,
+        // 3. Get concrete PostgresMemoryStore reference (required for hybrid search)
+        let pg_store = match &self.pg_store {
+            Some(s) => s,
             None => {
                 return Ok(CallToolResult::structured_error(json!({
                     "isError": true,
-                    "error": "Search is not available: embedding provider not configured",
+                    "error": "Search requires PostgreSQL backend",
                     "hint": "Use list_memories to browse memories"
                 })));
             }
         };
 
-        // 4. Embed the query
-        let query_vec = match provider.embed(&params.query).await {
-            Ok(vec) => vec,
-            Err(e) => {
-                return Ok(CallToolResult::structured_error(json!({
-                    "isError": true,
-                    "error": format!("Failed to embed search query: {}", e),
-                    "hint": "Try a simpler query or check embedding provider status"
-                })));
+        // 4. Optionally embed the query (graceful degradation to BM25-only if no provider)
+        let query_embedding: Option<pgvector::Vector> = if let Some(ref provider) = self.embedding_provider {
+            match provider.embed(&params.query).await {
+                Ok(vec) => Some(pgvector::Vector::from(vec)),
+                Err(e) => {
+                    tracing::warn!("Failed to embed search query, falling back to BM25-only: {}", e);
+                    None
+                }
             }
+        } else {
+            None
         };
 
         // 5. Parse optional datetime params
@@ -640,77 +648,104 @@ impl MemoryService {
             None
         };
 
-        // 6. Decode cursor to offset
-        let offset = if let Some(ref cursor) = params.cursor {
-            match decode_search_cursor(cursor) {
-                Ok(off) => off,
-                Err(e) => {
-                    return Ok(store_error_to_result(e));
-                }
-            }
-        } else {
-            0
-        };
-
-        // 7. Build SearchFilter
-        let filter = SearchFilter {
-            query_embedding: pgvector::Vector::from(query_vec),
-            limit: limit as i64,
-            offset,
+        // 6. Call hybrid_search — BM25 + vector with RRF fusion
+        // Note: cursor-based pagination not applied at this level; salience re-ranking
+        // must happen on the full result set before we can paginate meaningfully.
+        let tags_slice: Option<Vec<String>> = params.tags.clone();
+        let raw_hits = match pg_store.hybrid_search(
+            &params.query,
+            query_embedding.as_ref(),
+            limit as i64,
             created_after,
             created_before,
-            tags: params.tags,
-        };
-
-        // 8. Get concrete PostgresMemoryStore reference
-        let pg_store = match &self.pg_store {
-            Some(s) => s,
-            None => {
-                return Ok(CallToolResult::structured_error(json!({
-                    "isError": true,
-                    "error": "Search requires PostgreSQL backend",
-                    "hint": "Use list_memories to browse memories"
-                })));
-            }
-        };
-
-        // 9. Call search_similar and handle errors
-        let search_result = match pg_store.search_similar(&filter).await {
-            Ok(r) => r,
+            tags_slice.as_deref(),
+        ).await {
+            Ok(hits) => hits,
             Err(e) => return Ok(store_error_to_result(e)),
         };
 
-        // 10. Format results
-        let results: Vec<serde_json::Value> = search_result.hits.iter().map(|hit| {
-            json!({
+        // 7. Fetch salience data for all result IDs
+        let ids: Vec<String> = raw_hits.iter().map(|h| h.memory.id.clone()).collect();
+        let salience_data = match pg_store.get_salience_data(&ids).await {
+            Ok(data) => data,
+            Err(e) => return Ok(store_error_to_result(e)),
+        };
+
+        // 8. Build ScoredHit vec for salience re-ranking
+        let mut scored_hits: Vec<ScoredHit> = raw_hits
+            .into_iter()
+            .map(|hit| ScoredHit {
+                memory: hit.memory,
+                rrf_score: hit.rrf_score,
+                salience_score: 0.0, // populated by rank()
+                match_source: hit.match_source,
+                breakdown: None,     // populated by rank() when debug_scoring=true
+            })
+            .collect();
+
+        // 9. Build SalienceInput for each hit (parallel order to scored_hits)
+        let salience_inputs: Vec<SalienceInput> = scored_hits
+            .iter()
+            .map(|hit| {
+                let row = salience_data
+                    .get(&hit.memory.id)
+                    .cloned()
+                    .unwrap_or_default();
+                let days_since_reinforced = row.last_reinforced_at
+                    .map(|dt| {
+                        let duration = Utc::now().signed_duration_since(dt);
+                        (duration.num_seconds() as f64 / 86_400.0).max(0.0)
+                    })
+                    .unwrap_or(365.0); // 1 year default for never-reinforced memories
+                SalienceInput {
+                    stability: row.stability,
+                    days_since_reinforced,
+                }
+            })
+            .collect();
+
+        // 10. Apply salience re-ranking
+        let scorer = SalienceScorer::new(&self.salience_config);
+        scorer.rank(&mut scored_hits, &salience_inputs);
+
+        // 11. Format results
+        let count = scored_hits.len();
+        let results: Vec<serde_json::Value> = scored_hits.iter().map(|hit| {
+            let mut obj = json!({
                 "id": hit.memory.id,
                 "content": hit.memory.content,
-                "similarity": (hit.similarity * 1000.0).round() / 1000.0,
                 "type_hint": hit.memory.type_hint,
                 "source": hit.memory.source,
                 "tags": hit.memory.tags,
                 "created_at": hit.memory.created_at.to_rfc3339(),
                 "updated_at": hit.memory.updated_at.to_rfc3339(),
                 "access_count": hit.memory.access_count,
-            })
+                "relevance_score": (hit.salience_score * 1000.0).round() / 1000.0,
+                "match_source": hit.match_source,
+                "rrf_score": (hit.rrf_score * 10000.0).round() / 10000.0,
+            });
+            // Add score breakdown when debug_scoring is enabled
+            if let Some(ref bd) = hit.breakdown {
+                obj["score_breakdown"] = json!({
+                    "recency": (bd.recency * 1000.0).round() / 1000.0,
+                    "access": (bd.access * 1000.0).round() / 1000.0,
+                    "semantic": (bd.semantic * 1000.0).round() / 1000.0,
+                    "reinforcement": (bd.reinforcement * 1000.0).round() / 1000.0,
+                });
+            }
+            obj
         }).collect();
 
-        let count = results.len();
-
-        // 11. Build final response JSON
+        // 12. Build final response JSON
         let mut response = json!({
-            "results": results,
-            "count": count,
-            "total_matches": search_result.total_matches,
+            "memories": results,
+            "total_results": count,
             "query": params.query,
-            "next_cursor": search_result.next_cursor,
-            "has_more": search_result.has_more,
+            "has_more": false,
         });
 
         if count == 0 {
             response["hint"] = json!("No memories matched your query. Try broader search terms or use list_memories to browse all memories.");
-        } else if search_result.has_more {
-            response["hint"] = json!("Use next_cursor with cursor parameter to get the next page");
         }
 
         Ok(CallToolResult::structured(response))
