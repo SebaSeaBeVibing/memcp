@@ -14,7 +14,10 @@ use std::time::Duration;
 use uuid::Uuid;
 
 use crate::errors::MemcpError;
-use crate::store::{CreateMemory, ListFilter, ListResult, Memory, MemoryStore, UpdateMemory};
+use crate::store::{
+    encode_search_cursor, CreateMemory, ListFilter, ListResult, Memory, MemoryStore,
+    SearchFilter, SearchHit, SearchResult, UpdateMemory,
+};
 
 /// PostgreSQL-backed memory store using sqlx connection pool.
 pub struct PostgresMemoryStore {
@@ -681,5 +684,161 @@ impl PostgresMemoryStore {
     /// Return the underlying PgPool so embedding pipeline can share the connection pool.
     pub fn pool(&self) -> &PgPool {
         &self.pool
+    }
+
+    /// Search for memories semantically similar to the query embedding.
+    ///
+    /// Uses HNSW approximate nearest neighbor search ordered by cosine distance ascending.
+    /// When filters are present, enables hnsw.iterative_scan to prevent over-filtering.
+    /// Returns results with similarity scores, total match count, and OFFSET-based pagination.
+    pub async fn search_similar(
+        &self,
+        filter: &SearchFilter,
+    ) -> Result<SearchResult, MemcpError> {
+        // Acquire an explicit connection — SET hnsw.iterative_scan is session-scoped
+        // and must run on the same connection as the search query.
+        let mut conn = self.pool.acquire().await.map_err(|e| {
+            MemcpError::Storage(format!("Failed to acquire connection: {}", e))
+        })?;
+
+        // Determine if any optional filters are present
+        let has_filters = filter.created_after.is_some()
+            || filter.created_before.is_some()
+            || filter.tags.is_some();
+
+        // Enable iterative scan when filters are present to prevent over-filtering.
+        // Iterative scan requires pgvector 0.8.0+ — gracefully skip if SET fails.
+        if has_filters {
+            if let Err(e) = sqlx::query("SET hnsw.iterative_scan = 'relaxed_order'")
+                .execute(&mut *conn)
+                .await
+            {
+                tracing::warn!(
+                    "Failed to set hnsw.iterative_scan (pgvector < 0.8.0?): {}",
+                    e
+                );
+            }
+        }
+
+        // Build WHERE conditions with numbered PostgreSQL parameters.
+        // $1 is always the query embedding — build filter params starting at $2.
+        let mut conditions: Vec<String> = Vec::new();
+        // Always filter for current embeddings on complete memories
+        conditions.push("me.is_current = true".to_string());
+        conditions.push("m.embedding_status = 'complete'".to_string());
+
+        let mut param_idx: u32 = 2; // $1 is reserved for query_embedding
+
+        if filter.created_after.is_some() {
+            conditions.push(format!("m.created_at > ${}", param_idx));
+            param_idx += 1;
+        }
+        if filter.created_before.is_some() {
+            conditions.push(format!("m.created_at < ${}", param_idx));
+            param_idx += 1;
+        }
+        if filter.tags.is_some() {
+            // JSONB containment: matches memories that have ALL specified tags
+            conditions.push(format!("m.tags @> ${}::jsonb", param_idx));
+            param_idx += 1;
+        }
+
+        let where_clause = format!("WHERE {}", conditions.join(" AND "));
+
+        // Main search query: JOIN memories with embeddings, compute cosine similarity,
+        // ORDER BY distance ASC (NOT alias) so HNSW index is used.
+        let sql = format!(
+            "SELECT m.id, m.content, m.type_hint, m.source, m.tags, \
+                    m.created_at, m.updated_at, m.last_accessed_at, \
+                    m.access_count, m.embedding_status, \
+                    (1 - (me.embedding <=> $1)) AS similarity \
+             FROM memories m \
+             JOIN memory_embeddings me ON me.memory_id = m.id \
+             {} \
+             ORDER BY me.embedding <=> $1 ASC \
+             LIMIT ${} OFFSET ${}",
+            where_clause, param_idx, param_idx + 1
+        );
+
+        // Count query: same JOIN and WHERE but no ORDER BY / LIMIT / OFFSET
+        let count_sql = format!(
+            "SELECT COUNT(*) as total \
+             FROM memories m \
+             JOIN memory_embeddings me ON me.memory_id = m.id \
+             {}",
+            where_clause
+        );
+
+        // Helper: bind all optional filter params (same order for both queries)
+        // We build the binding in a macro-like closure to avoid code duplication.
+        // Binding order: $1=query_embedding, $2=created_after?, $3=created_before?, $4=tags?
+
+        // Execute main search query
+        let mut q = sqlx::query(&sql).bind(&filter.query_embedding);
+        if let Some(ref ca) = filter.created_after {
+            q = q.bind(ca);
+        }
+        if let Some(ref cb) = filter.created_before {
+            q = q.bind(cb);
+        }
+        if let Some(ref tags) = filter.tags {
+            q = q.bind(serde_json::json!(tags));
+        }
+        q = q.bind(filter.limit).bind(filter.offset);
+
+        let rows = q
+            .fetch_all(&mut *conn)
+            .await
+            .map_err(|e| MemcpError::Storage(format!("Search query failed: {}", e)))?;
+
+        // Execute count query on same connection
+        let mut count_q = sqlx::query(&count_sql).bind(&filter.query_embedding);
+        if let Some(ref ca) = filter.created_after {
+            count_q = count_q.bind(ca);
+        }
+        if let Some(ref cb) = filter.created_before {
+            count_q = count_q.bind(cb);
+        }
+        if let Some(ref tags) = filter.tags {
+            count_q = count_q.bind(serde_json::json!(tags));
+        }
+
+        let count_row = count_q
+            .fetch_one(&mut *conn)
+            .await
+            .map_err(|e| MemcpError::Storage(format!("Search count query failed: {}", e)))?;
+
+        let total_matches: i64 = count_row
+            .try_get("total")
+            .map_err(|e| MemcpError::Storage(e.to_string()))?;
+        let total_matches = total_matches as u64;
+
+        // Parse result rows into SearchHit records
+        let mut hits = Vec::with_capacity(rows.len());
+        for row in &rows {
+            let memory = row_to_memory(row)?;
+            let raw_similarity: f64 = row
+                .try_get("similarity")
+                .map_err(|e| MemcpError::Storage(e.to_string()))?;
+            // Clamp to [0.0, 1.0] to handle floating point edge cases
+            let similarity = raw_similarity.clamp(0.0, 1.0);
+            hits.push(SearchHit { memory, similarity });
+        }
+
+        // Compute OFFSET-based pagination
+        let next_offset = filter.offset + filter.limit;
+        let has_more = next_offset < total_matches as i64;
+        let next_cursor = if has_more {
+            Some(encode_search_cursor(next_offset))
+        } else {
+            None
+        };
+
+        Ok(SearchResult {
+            hits,
+            total_matches,
+            next_cursor,
+            has_more,
+        })
     }
 }
