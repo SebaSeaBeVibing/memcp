@@ -863,6 +863,101 @@ impl PostgresMemoryStore {
         Ok(())
     }
 
+    /// Explicitly reinforce a memory's salience using an FSRS-inspired stability update.
+    ///
+    /// The key spaced repetition property (SRCH-04): faded memories (low retrievability)
+    /// receive a larger stability boost than fresh memories (high retrievability).
+    /// Formula: new_stability = stability * (1.0 + (1.0 - retrievability) * multiplier)
+    /// where multiplier=1.5 for "good", 2.0 for "easy".
+    ///
+    /// Clamps resulting stability to [0.1, 36500.0] (0.1 days to ~100 years).
+    /// Increments reinforcement_count and sets last_reinforced_at = now.
+    pub async fn reinforce_salience(
+        &self,
+        memory_id: &str,
+        rating: &str,
+    ) -> Result<SalienceRow, MemcpError> {
+        // 1. Fetch current salience row (defaults if no row exists)
+        let row_map = self.get_salience_data(&[memory_id.to_string()]).await?;
+        let current = row_map.get(memory_id).cloned().unwrap_or_default();
+
+        // 2. Compute days elapsed since last reinforcement (or 365 if never reinforced)
+        let days_elapsed = current.last_reinforced_at
+            .map(|dt| {
+                let duration = Utc::now().signed_duration_since(dt);
+                (duration.num_seconds() as f64 / 86_400.0).max(0.0)
+            })
+            .unwrap_or(365.0);
+
+        // 3. Compute current retrievability (how fresh is the memory right now?)
+        let retrievability = crate::search::salience::fsrs_retrievability(
+            current.stability,
+            days_elapsed,
+        );
+
+        // 4. Update stability — faded memories (low retrievability) get bigger boosts
+        //    multiplier: 1.5 for "good", 2.0 for "easy"
+        let multiplier = if rating == "easy" { 2.0_f64 } else { 1.5_f64 };
+        let new_stability = current.stability * (1.0 + (1.0 - retrievability) * multiplier);
+
+        // 5. Clamp to [0.1, 36500.0]
+        let new_stability = new_stability.clamp(0.1, 36_500.0);
+
+        let new_count = current.reinforcement_count + 1;
+        let now = Utc::now();
+
+        // 6. Upsert to memory_salience
+        sqlx::query(
+            "INSERT INTO memory_salience \
+             (memory_id, stability, difficulty, reinforcement_count, last_reinforced_at, created_at, updated_at) \
+             VALUES ($1, $2, $3, $4, $5, $6, $6) \
+             ON CONFLICT (memory_id) DO UPDATE SET \
+               stability = EXCLUDED.stability, \
+               reinforcement_count = EXCLUDED.reinforcement_count, \
+               last_reinforced_at = EXCLUDED.last_reinforced_at, \
+               updated_at = EXCLUDED.updated_at",
+        )
+        .bind(memory_id)
+        .bind(new_stability)
+        .bind(current.difficulty)
+        .bind(new_count)
+        .bind(&now)
+        .bind(&now)
+        .execute(&self.pool)
+        .await
+        .map_err(|e| MemcpError::Storage(format!("Failed to reinforce salience: {}", e)))?;
+
+        // 7. Return updated SalienceRow
+        Ok(SalienceRow {
+            stability: new_stability,
+            difficulty: current.difficulty,
+            reinforcement_count: new_count,
+            last_reinforced_at: Some(now),
+        })
+    }
+
+    /// Apply a small implicit salience bump from direct memory retrieval.
+    ///
+    /// stability *= 1.1 — passive access gently maintains freshness.
+    /// Uses INSERT ON CONFLICT for lazy row creation.
+    /// Does NOT update last_reinforced_at or increment reinforcement_count.
+    pub async fn touch_salience(&self, memory_id: &str) -> Result<(), MemcpError> {
+        let sql = "INSERT INTO memory_salience (memory_id, stability, updated_at) \
+            VALUES ($1, 1.1, NOW()) \
+            ON CONFLICT (memory_id) \
+            DO UPDATE SET \
+                stability = memory_salience.stability * 1.1, \
+                updated_at = NOW()";
+
+        sqlx::query(sql)
+            .bind(memory_id)
+            .execute(&self.pool)
+            .await
+            .map_err(|e| MemcpError::Storage(e.to_string()))?;
+
+        Ok(())
+    }
+
     /// Search for memories semantically similar to the query embedding.
     ///
     /// Uses HNSW approximate nearest neighbor search ordered by cosine distance ascending.
