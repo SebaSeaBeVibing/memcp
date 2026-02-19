@@ -200,6 +200,112 @@ impl Default for ConsolidationConfig {
     }
 }
 
+/// Configuration for the query intelligence subsystem.
+///
+/// Both expansion and re-ranking are disabled by default — opt in explicitly.
+/// Nested env var overrides use double underscores:
+///   MEMCP_QUERY_INTELLIGENCE__EXPANSION_ENABLED=true
+///   MEMCP_QUERY_INTELLIGENCE__RERANKING_PROVIDER=openai
+///   MEMCP_QUERY_INTELLIGENCE__OPENAI_API_KEY=sk-...
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct QueryIntelligenceConfig {
+    /// Enable query expansion (default: false — off by default)
+    #[serde(default)]
+    pub expansion_enabled: bool,
+
+    /// Enable LLM re-ranking (default: false — off by default)
+    #[serde(default)]
+    pub reranking_enabled: bool,
+
+    /// Provider for expansion: "ollama" or "openai" (default: "ollama")
+    #[serde(default = "default_qi_provider")]
+    pub expansion_provider: String,
+
+    /// Provider for reranking: "ollama" or "openai" (default: "ollama")
+    #[serde(default = "default_qi_provider")]
+    pub reranking_provider: String,
+
+    /// Ollama base URL (shared with extraction config but independently overridable)
+    #[serde(default = "default_ollama_base_url")]
+    pub ollama_base_url: String,
+
+    /// Ollama model for expansion
+    #[serde(default = "default_qi_ollama_model")]
+    pub expansion_ollama_model: String,
+
+    /// Ollama model for reranking
+    #[serde(default = "default_qi_ollama_model")]
+    pub reranking_ollama_model: String,
+
+    /// OpenAI-compatible base URL (supports Kimi, custom endpoints)
+    #[serde(default = "default_qi_openai_base_url")]
+    pub openai_base_url: String,
+
+    /// OpenAI-compatible API key — only required when provider = "openai"
+    #[serde(default)]
+    pub openai_api_key: Option<String>,
+
+    /// OpenAI model for expansion
+    #[serde(default = "default_qi_openai_model")]
+    pub expansion_openai_model: String,
+
+    /// OpenAI model for reranking
+    #[serde(default = "default_qi_openai_model")]
+    pub reranking_openai_model: String,
+
+    /// Maximum combined latency budget in ms (default: 2000)
+    #[serde(default = "default_latency_budget_ms")]
+    pub latency_budget_ms: u64,
+
+    /// Max content chars sent to re-ranker per candidate (default: 500)
+    #[serde(default = "default_rerank_content_chars")]
+    pub rerank_content_chars: usize,
+}
+
+fn default_qi_provider() -> String {
+    "ollama".to_string()
+}
+
+fn default_qi_ollama_model() -> String {
+    "llama3.2:3b".to_string()
+}
+
+fn default_qi_openai_base_url() -> String {
+    "https://api.openai.com/v1".to_string()
+}
+
+fn default_qi_openai_model() -> String {
+    "gpt-4o-mini".to_string()
+}
+
+fn default_latency_budget_ms() -> u64 {
+    2000
+}
+
+fn default_rerank_content_chars() -> usize {
+    500
+}
+
+impl Default for QueryIntelligenceConfig {
+    fn default() -> Self {
+        QueryIntelligenceConfig {
+            expansion_enabled: false,
+            reranking_enabled: false,
+            expansion_provider: default_qi_provider(),
+            reranking_provider: default_qi_provider(),
+            ollama_base_url: default_ollama_base_url(),
+            expansion_ollama_model: default_qi_ollama_model(),
+            reranking_ollama_model: default_qi_ollama_model(),
+            openai_base_url: default_qi_openai_base_url(),
+            openai_api_key: None,
+            expansion_openai_model: default_qi_openai_model(),
+            reranking_openai_model: default_qi_openai_model(),
+            latency_budget_ms: default_latency_budget_ms(),
+            rerank_content_chars: default_rerank_content_chars(),
+        }
+    }
+}
+
 /// Configuration for the embedding provider subsystem.
 ///
 /// Provider selection is explicit — having an API key does NOT auto-switch from local.
@@ -282,6 +388,11 @@ pub struct Config {
     /// Existing configs without [consolidation] section still work (serde default applied).
     #[serde(default)]
     pub consolidation: ConsolidationConfig,
+
+    /// Query intelligence configuration (expansion + re-ranking).
+    /// Existing configs without [query_intelligence] section still work (serde default applied).
+    #[serde(default)]
+    pub query_intelligence: QueryIntelligenceConfig,
 }
 
 fn default_log_level() -> String {
@@ -303,6 +414,7 @@ impl Default for Config {
             salience: SalienceConfig::default(),
             extraction: ExtractionConfig::default(),
             consolidation: ConsolidationConfig::default(),
+            query_intelligence: QueryIntelligenceConfig::default(),
         }
     }
 }
