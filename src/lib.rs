@@ -1,4 +1,5 @@
 pub mod config;
+pub mod consolidation;
 pub mod embedding;
 pub mod errors;
 pub mod extraction;

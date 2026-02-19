@@ -162,6 +162,44 @@ impl Default for ExtractionConfig {
     }
 }
 
+/// Configuration for the memory consolidation subsystem.
+///
+/// When enabled, new memories trigger a pgvector similarity check after embedding.
+/// If any existing memories exceed the threshold, they are auto-merged via LLM synthesis.
+/// Nested env var overrides use double underscores:
+///   MEMCP_CONSOLIDATION__ENABLED=false
+///   MEMCP_CONSOLIDATION__SIMILARITY_THRESHOLD=0.92
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ConsolidationConfig {
+    /// Whether consolidation is enabled (default: true).
+    /// Set to false to disable automatic merging.
+    #[serde(default = "default_consolidation_enabled")]
+    pub enabled: bool,
+
+    /// Cosine similarity threshold above which memories are merged (default: 0.92).
+    /// Range: 0.0–1.0. Higher values require tighter similarity before merging.
+    #[serde(default = "default_similarity_threshold")]
+    pub similarity_threshold: f64,
+
+    /// Maximum number of originals merged into a single consolidated memory (default: 5).
+    #[serde(default = "default_max_consolidation_group")]
+    pub max_consolidation_group: usize,
+}
+
+fn default_consolidation_enabled() -> bool { true }
+fn default_similarity_threshold() -> f64 { 0.92 }
+fn default_max_consolidation_group() -> usize { 5 }
+
+impl Default for ConsolidationConfig {
+    fn default() -> Self {
+        ConsolidationConfig {
+            enabled: default_consolidation_enabled(),
+            similarity_threshold: default_similarity_threshold(),
+            max_consolidation_group: default_max_consolidation_group(),
+        }
+    }
+}
+
 /// Configuration for the embedding provider subsystem.
 ///
 /// Provider selection is explicit — having an API key does NOT auto-switch from local.
@@ -239,6 +277,11 @@ pub struct Config {
     /// Existing configs without [extraction] section still work (serde default applied).
     #[serde(default)]
     pub extraction: ExtractionConfig,
+
+    /// Memory consolidation configuration.
+    /// Existing configs without [consolidation] section still work (serde default applied).
+    #[serde(default)]
+    pub consolidation: ConsolidationConfig,
 }
 
 fn default_log_level() -> String {
@@ -259,6 +302,7 @@ impl Default for Config {
             search: SearchConfig::default(),
             salience: SalienceConfig::default(),
             extraction: ExtractionConfig::default(),
+            consolidation: ConsolidationConfig::default(),
         }
     }
 }

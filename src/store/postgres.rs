@@ -1448,4 +1448,113 @@ impl PostgresMemoryStore {
             })
             .collect::<Result<Vec<_>, MemcpError>>()
     }
+
+    // -------------------------------------------------------------------------
+    // Consolidation pipeline support methods
+    // -------------------------------------------------------------------------
+
+    /// Atomically create a consolidated memory and link its originals.
+    ///
+    /// Runs in a single database transaction:
+    /// 1. INSERT a new memory row with `type_hint='consolidated'`, `source='consolidation'`.
+    /// 2. For each source_id: INSERT into `memory_consolidations` with similarity score.
+    /// 3. For each source_id: UPDATE memories SET `is_consolidated_original=TRUE`, `consolidated_into=id`.
+    ///
+    /// The UNIQUE constraint on (consolidated_id, original_id) prevents race conditions —
+    /// concurrent workers attempting the same consolidation will get a duplicate key error,
+    /// which the caller should handle gracefully by ignoring the violation.
+    ///
+    /// Returns the new consolidated memory's ID.
+    pub async fn create_consolidated_memory(
+        &self,
+        content: &str,
+        source_ids: &[String],
+        similarities: &[f64],
+    ) -> Result<String, MemcpError> {
+        let consolidated_id = Uuid::new_v4().to_string();
+        let now = Utc::now();
+
+        // Start a database transaction for atomic create + link + mark
+        let mut tx = self.pool.begin().await.map_err(|e| {
+            MemcpError::Storage(format!("Failed to begin consolidation transaction: {}", e))
+        })?;
+
+        // 1. Insert the consolidated memory row
+        sqlx::query(
+            "INSERT INTO memories \
+             (id, content, type_hint, source, created_at, updated_at, access_count, \
+              embedding_status, extraction_status) \
+             VALUES ($1, $2, 'consolidated', 'consolidation', $3, $3, 0, 'pending', 'pending')",
+        )
+        .bind(&consolidated_id)
+        .bind(content)
+        .bind(&now)
+        .execute(&mut *tx)
+        .await
+        .map_err(|e| MemcpError::Storage(format!("Failed to insert consolidated memory: {}", e)))?;
+
+        // 2. Insert consolidation provenance records + mark originals
+        for (source_id, &similarity) in source_ids.iter().zip(similarities.iter()) {
+            let link_id = Uuid::new_v4().to_string();
+
+            // Insert memory_consolidations record
+            sqlx::query(
+                "INSERT INTO memory_consolidations \
+                 (id, consolidated_id, original_id, similarity_score, created_at) \
+                 VALUES ($1, $2, $3, $4, $5)",
+            )
+            .bind(&link_id)
+            .bind(&consolidated_id)
+            .bind(source_id)
+            .bind(similarity as f32)  // REAL column — use f32
+            .bind(&now)
+            .execute(&mut *tx)
+            .await
+            .map_err(|e| MemcpError::Storage(format!("Failed to insert consolidation link: {}", e)))?;
+
+            // Mark original as consolidated
+            sqlx::query(
+                "UPDATE memories SET is_consolidated_original = TRUE, consolidated_into = $1 \
+                 WHERE id = $2",
+            )
+            .bind(&consolidated_id)
+            .bind(source_id)
+            .execute(&mut *tx)
+            .await
+            .map_err(|e| MemcpError::Storage(format!("Failed to mark original as consolidated: {}", e)))?;
+        }
+
+        // Commit the transaction atomically
+        tx.commit().await.map_err(|e| {
+            MemcpError::Storage(format!("Failed to commit consolidation transaction: {}", e))
+        })?;
+
+        Ok(consolidated_id)
+    }
+
+    /// Fetch the current embedding vector for a memory.
+    ///
+    /// Returns None if no current embedding exists (not yet embedded, or embedding was staled).
+    pub async fn get_memory_embedding(
+        &self,
+        memory_id: &str,
+    ) -> Result<Option<pgvector::Vector>, MemcpError> {
+        let row = sqlx::query(
+            "SELECT embedding FROM memory_embeddings WHERE memory_id = $1 AND is_current = TRUE",
+        )
+        .bind(memory_id)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(|e| MemcpError::Storage(format!("Failed to fetch memory embedding: {}", e)))?;
+
+        match row {
+            None => Ok(None),
+            Some(r) => {
+                let embedding: pgvector::Vector = r
+                    .try_get("embedding")
+                    .map_err(|e| MemcpError::Storage(e.to_string()))?;
+                Ok(Some(embedding))
+            }
+        }
+    }
 }
