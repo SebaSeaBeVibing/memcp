@@ -10,6 +10,8 @@ use tokio::sync::mpsc;
 use uuid::Uuid;
 
 use super::{EmbeddingJob, EmbeddingProvider, build_embedding_text};
+use crate::consolidation::ConsolidationJob;
+use crate::store::MemoryStore;
 use crate::store::postgres::PostgresMemoryStore;
 
 /// Async embedding pipeline: enqueues jobs onto a bounded mpsc channel and
@@ -24,10 +26,13 @@ impl EmbeddingPipeline {
     /// - `provider`: The embedding provider to call for each job.
     /// - `store`: The PostgresMemoryStore for storing embeddings and updating status.
     /// - `capacity`: Bounded channel capacity (recommended: 1000).
+    /// - `consolidation_sender`: Optional channel to the consolidation worker. When provided,
+    ///   each successfully embedded memory triggers a consolidation check via this channel.
     pub fn new(
         provider: Arc<dyn EmbeddingProvider>,
         store: Arc<PostgresMemoryStore>,
         capacity: usize,
+        consolidation_sender: Option<mpsc::Sender<ConsolidationJob>>,
     ) -> Self {
         let (tx, mut rx) = mpsc::channel::<EmbeddingJob>(capacity);
         // Clone tx for retry re-sends inside the worker
@@ -56,6 +61,30 @@ impl EmbeddingPipeline {
                         } else {
                             let _ = store.update_embedding_status(&job.memory_id, "complete").await;
                             tracing::debug!(memory_id = %job.memory_id, "Embedding complete");
+
+                            // Trigger consolidation check after successful embedding.
+                            // Consolidation requires the embedding to exist first (for cosine similarity).
+                            // try_send is non-blocking — if the channel is full, skip consolidation for
+                            // this memory (not critical, backfill does not apply here).
+                            if let Some(ref consolidation_tx) = consolidation_sender {
+                                // Fetch the memory content for synthesis if consolidation triggers
+                                match store.get(&job.memory_id).await {
+                                    Ok(memory) => {
+                                        let _ = consolidation_tx.try_send(ConsolidationJob {
+                                            memory_id: job.memory_id.clone(),
+                                            embedding: embedding.clone(),
+                                            content: memory.content,
+                                        });
+                                    }
+                                    Err(e) => {
+                                        tracing::warn!(
+                                            memory_id = %job.memory_id,
+                                            error = %e,
+                                            "Failed to fetch memory for consolidation job — skipping"
+                                        );
+                                    }
+                                }
+                            }
                         }
                     }
                     Err(e) if job.attempt < 3 => {

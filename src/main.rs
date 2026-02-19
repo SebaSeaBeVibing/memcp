@@ -3,6 +3,7 @@ use clap::{Parser, Subcommand};
 use std::sync::Arc;
 use std::time::Duration;
 use memcp::config::Config;
+use memcp::consolidation::ConsolidationWorker;
 use memcp::embedding::EmbeddingProvider;
 use memcp::embedding::local::LocalEmbeddingProvider;
 use memcp::embedding::openai::OpenAIEmbeddingProvider;
@@ -136,7 +137,8 @@ async fn main() -> Result<()> {
                 EmbedAction::Backfill => {
                     println!("Starting embedding backfill...");
                     let provider = create_embedding_provider(&config).await?;
-                    let pipeline = EmbeddingPipeline::new(provider, store.clone(), 1000);
+                    // No consolidation during manual backfill — consolidation is a live trigger only
+                    let pipeline = EmbeddingPipeline::new(provider, store.clone(), 1000, None);
                     let count = backfill(&store, &pipeline.sender()).await;
                     println!("Queued {} memories for embedding.", count);
                     // Wait briefly for some embeddings to process
@@ -192,7 +194,29 @@ async fn main() -> Result<()> {
             let provider = create_embedding_provider(&config).await
                 .expect("Failed to initialize embedding provider");
             let provider_for_search = provider.clone();  // Clone for MemoryService search
-            let pipeline = EmbeddingPipeline::new(provider, store.clone(), 1000);
+
+            // 6b. Create consolidation worker if enabled (must happen before embedding pipeline)
+            // Consolidation is triggered indirectly via the embedding pipeline's completion callback.
+            let consolidation_sender = if config.consolidation.enabled {
+                let worker = ConsolidationWorker::new(
+                    store.clone(),
+                    config.consolidation.clone(),
+                    config.extraction.ollama_base_url.clone(),
+                    config.extraction.ollama_model.clone(),
+                    500,
+                );
+                tracing::info!(
+                    threshold = config.consolidation.similarity_threshold,
+                    max_group = config.consolidation.max_consolidation_group,
+                    "Consolidation worker started"
+                );
+                Some(worker.sender())
+            } else {
+                tracing::info!("Consolidation disabled via config (consolidation.enabled=false)");
+                None
+            };
+
+            let pipeline = EmbeddingPipeline::new(provider, store.clone(), 1000, consolidation_sender);
 
             // 7. Run startup backfill — queue any un-embedded memories from previous runs
             let queued = backfill(&store, &pipeline.sender()).await;
