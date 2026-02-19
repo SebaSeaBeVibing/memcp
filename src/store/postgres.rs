@@ -1376,4 +1376,76 @@ impl PostgresMemoryStore {
             Ok((id, rank))
         }).collect::<Result<Vec<_>, MemcpError>>()
     }
+
+    // -------------------------------------------------------------------------
+    // Extraction pipeline support methods
+    // -------------------------------------------------------------------------
+
+    /// Store extraction results (entities and facts) for a memory.
+    ///
+    /// Updates the extracted_entities and extracted_facts JSONB columns.
+    /// Called by the extraction pipeline after successful entity/fact extraction.
+    pub async fn update_extraction_results(
+        &self,
+        memory_id: &str,
+        entities: &[String],
+        facts: &[String],
+    ) -> Result<(), MemcpError> {
+        let entities_json = serde_json::json!(entities);
+        let facts_json = serde_json::json!(facts);
+
+        sqlx::query(
+            "UPDATE memories SET extracted_entities = $2, extracted_facts = $3 WHERE id = $1",
+        )
+        .bind(memory_id)
+        .bind(&entities_json)
+        .bind(&facts_json)
+        .execute(&self.pool)
+        .await
+        .map_err(|e| MemcpError::Storage(format!("Failed to update extraction results: {}", e)))?;
+
+        Ok(())
+    }
+
+    /// Update the extraction_status column for a memory.
+    ///
+    /// Valid statuses: "pending", "complete", "failed".
+    pub async fn update_extraction_status(
+        &self,
+        memory_id: &str,
+        status: &str,
+    ) -> Result<(), MemcpError> {
+        sqlx::query("UPDATE memories SET extraction_status = $2 WHERE id = $1")
+            .bind(memory_id)
+            .bind(status)
+            .execute(&self.pool)
+            .await
+            .map_err(|e| MemcpError::Storage(format!("Failed to update extraction status: {}", e)))?;
+
+        Ok(())
+    }
+
+    /// Fetch memories with pending extraction status for backfill.
+    ///
+    /// Returns (id, content) pairs for queuing into the extraction pipeline.
+    pub async fn get_pending_extraction(
+        &self,
+        limit: i64,
+    ) -> Result<Vec<(String, String)>, MemcpError> {
+        let rows = sqlx::query(
+            "SELECT id, content FROM memories WHERE extraction_status = 'pending' LIMIT $1",
+        )
+        .bind(limit)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|e| MemcpError::Storage(format!("Failed to fetch pending extractions: {}", e)))?;
+
+        rows.iter()
+            .map(|row| {
+                let id: String = row.try_get("id").map_err(|e| MemcpError::Storage(e.to_string()))?;
+                let content: String = row.try_get("content").map_err(|e| MemcpError::Storage(e.to_string()))?;
+                Ok((id, content))
+            })
+            .collect::<Result<Vec<_>, MemcpError>>()
+    }
 }

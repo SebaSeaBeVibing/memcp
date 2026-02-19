@@ -86,6 +86,82 @@ impl Default for SalienceConfig {
     }
 }
 
+/// Configuration for the extraction pipeline subsystem.
+///
+/// Provider selection is explicit — "ollama" is the default (local, no API key needed).
+/// Nested env var overrides use double underscores:
+///   MEMCP_EXTRACTION__PROVIDER=openai
+///   MEMCP_EXTRACTION__OPENAI_API_KEY=sk-...
+///   MEMCP_EXTRACTION__ENABLED=false
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ExtractionConfig {
+    /// Which provider to use: "ollama" (local, default) or "openai"
+    #[serde(default = "default_extraction_provider")]
+    pub provider: String,
+
+    /// Ollama server base URL
+    #[serde(default = "default_ollama_base_url")]
+    pub ollama_base_url: String,
+
+    /// Ollama model for extraction
+    #[serde(default = "default_ollama_model")]
+    pub ollama_model: String,
+
+    /// OpenAI API key — only required when provider = "openai"
+    #[serde(default)]
+    pub openai_api_key: Option<String>,
+
+    /// OpenAI model for extraction
+    #[serde(default = "default_openai_extraction_model")]
+    pub openai_model: String,
+
+    /// Whether extraction is enabled (default: true). Set to false to skip extraction entirely.
+    #[serde(default = "default_extraction_enabled")]
+    pub enabled: bool,
+
+    /// Maximum content characters to send for extraction (truncated beyond this)
+    #[serde(default = "default_max_content_chars")]
+    pub max_content_chars: usize,
+}
+
+fn default_extraction_provider() -> String {
+    "ollama".to_string()
+}
+
+fn default_ollama_base_url() -> String {
+    "http://localhost:11434".to_string()
+}
+
+fn default_ollama_model() -> String {
+    "llama3.2:3b".to_string()
+}
+
+fn default_openai_extraction_model() -> String {
+    "gpt-4o-mini".to_string()
+}
+
+fn default_extraction_enabled() -> bool {
+    true
+}
+
+fn default_max_content_chars() -> usize {
+    1500
+}
+
+impl Default for ExtractionConfig {
+    fn default() -> Self {
+        ExtractionConfig {
+            provider: default_extraction_provider(),
+            ollama_base_url: default_ollama_base_url(),
+            ollama_model: default_ollama_model(),
+            openai_api_key: None,
+            openai_model: default_openai_extraction_model(),
+            enabled: default_extraction_enabled(),
+            max_content_chars: default_max_content_chars(),
+        }
+    }
+}
+
 /// Configuration for the embedding provider subsystem.
 ///
 /// Provider selection is explicit — having an API key does NOT auto-switch from local.
@@ -158,6 +234,11 @@ pub struct Config {
     /// Existing configs without [salience] section still work (serde default applied).
     #[serde(default)]
     pub salience: SalienceConfig,
+
+    /// Extraction pipeline configuration.
+    /// Existing configs without [extraction] section still work (serde default applied).
+    #[serde(default)]
+    pub extraction: ExtractionConfig,
 }
 
 fn default_log_level() -> String {
@@ -177,6 +258,7 @@ impl Default for Config {
             embedding: EmbeddingConfig::default(),
             search: SearchConfig::default(),
             salience: SalienceConfig::default(),
+            extraction: ExtractionConfig::default(),
         }
     }
 }
