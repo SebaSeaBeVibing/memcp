@@ -14,6 +14,9 @@ use memcp::extraction::ollama::OllamaExtractionProvider;
 use memcp::extraction::openai::OpenAIExtractionProvider;
 use memcp::extraction::pipeline::ExtractionPipeline;
 use memcp::logging;
+use memcp::query_intelligence::QueryIntelligenceProvider;
+use memcp::query_intelligence::ollama::OllamaQueryIntelligenceProvider;
+use memcp::query_intelligence::openai::OpenAIQueryIntelligenceProvider;
 use memcp::server::MemoryService;
 use memcp::store::postgres::PostgresMemoryStore;
 use rmcp::ServiceExt;
@@ -77,6 +80,56 @@ fn create_extraction_provider(config: &Config) -> Result<Arc<dyn ExtractionProvi
                 config.extraction.ollama_base_url.clone(),
                 config.extraction.ollama_model.clone(),
                 config.extraction.max_content_chars,
+            )))
+        }
+    }
+}
+
+/// Create the QI expansion provider based on configuration.
+fn create_qi_expansion_provider(config: &Config) -> Result<Arc<dyn QueryIntelligenceProvider + Send + Sync>> {
+    match config.query_intelligence.expansion_provider.as_str() {
+        "openai" => {
+            let api_key = config.query_intelligence.openai_api_key.clone()
+                .ok_or_else(|| anyhow::anyhow!(
+                    "OpenAI API key required when query intelligence expansion provider is 'openai'. \
+                     Set MEMCP_QUERY_INTELLIGENCE__OPENAI_API_KEY or query_intelligence.openai_api_key in memcp.toml"
+                ))?;
+            let provider = OpenAIQueryIntelligenceProvider::new(
+                config.query_intelligence.openai_base_url.clone(),
+                api_key,
+                config.query_intelligence.expansion_openai_model.clone(),
+            ).map_err(|e| anyhow::anyhow!("{}", e))?;
+            Ok(Arc::new(provider))
+        }
+        "ollama" | _ => {
+            Ok(Arc::new(OllamaQueryIntelligenceProvider::new(
+                config.query_intelligence.ollama_base_url.clone(),
+                config.query_intelligence.expansion_ollama_model.clone(),
+            )))
+        }
+    }
+}
+
+/// Create the QI reranking provider based on configuration.
+fn create_qi_reranking_provider(config: &Config) -> Result<Arc<dyn QueryIntelligenceProvider + Send + Sync>> {
+    match config.query_intelligence.reranking_provider.as_str() {
+        "openai" => {
+            let api_key = config.query_intelligence.openai_api_key.clone()
+                .ok_or_else(|| anyhow::anyhow!(
+                    "OpenAI API key required when query intelligence reranking provider is 'openai'. \
+                     Set MEMCP_QUERY_INTELLIGENCE__OPENAI_API_KEY or query_intelligence.openai_api_key in memcp.toml"
+                ))?;
+            let provider = OpenAIQueryIntelligenceProvider::new(
+                config.query_intelligence.openai_base_url.clone(),
+                api_key,
+                config.query_intelligence.reranking_openai_model.clone(),
+            ).map_err(|e| anyhow::anyhow!("{}", e))?;
+            Ok(Arc::new(provider))
+        }
+        "ollama" | _ => {
+            Ok(Arc::new(OllamaQueryIntelligenceProvider::new(
+                config.query_intelligence.ollama_base_url.clone(),
+                config.query_intelligence.reranking_ollama_model.clone(),
             )))
         }
     }
@@ -260,7 +313,38 @@ async fn main() -> Result<()> {
                 None
             };
 
-            // 9. Create service with store, pipeline, embedding provider, salience config, and extraction pipeline
+            // 9. Create QI providers if enabled
+            let qi_expansion_provider = if config.query_intelligence.expansion_enabled {
+                match create_qi_expansion_provider(&config) {
+                    Ok(p) => {
+                        tracing::info!(provider = %config.query_intelligence.expansion_provider, "Query expansion enabled");
+                        Some(p)
+                    }
+                    Err(e) => {
+                        tracing::warn!(error = %e, "Failed to init expansion provider — expansion disabled");
+                        None
+                    }
+                }
+            } else {
+                None
+            };
+
+            let qi_reranking_provider = if config.query_intelligence.reranking_enabled {
+                match create_qi_reranking_provider(&config) {
+                    Ok(p) => {
+                        tracing::info!(provider = %config.query_intelligence.reranking_provider, "Query reranking enabled");
+                        Some(p)
+                    }
+                    Err(e) => {
+                        tracing::warn!(error = %e, "Failed to init reranking provider — reranking disabled");
+                        None
+                    }
+                }
+            } else {
+                None
+            };
+
+            // 10. Create service with store, pipeline, embedding provider, salience config, extraction pipeline, and QI providers
             let pg_store_for_search = store.clone();
             let service = MemoryService::new(
                 store as Arc<dyn memcp::store::MemoryStore + Send + Sync>,
@@ -269,15 +353,18 @@ async fn main() -> Result<()> {
                 Some(pg_store_for_search),
                 config.salience.clone(),
                 extraction_pipeline,
+                qi_expansion_provider,
+                qi_reranking_provider,
+                config.query_intelligence.clone(),
             );
 
-            // 10. Serve via stdio transport
+            // 11. Serve via stdio transport
             let (stdin, stdout) = rmcp::transport::io::stdio();
             let server = service.serve((stdin, stdout)).await?;
 
             tracing::info!("memcp server running — awaiting tool calls via stdio");
 
-            // 11. Wait for shutdown (client disconnects or signal)
+            // 12. Wait for shutdown (client disconnects or signal)
             server.waiting().await?;
 
             tracing::info!("memcp server stopped");

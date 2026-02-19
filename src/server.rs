@@ -34,6 +34,9 @@ pub struct MemoryService {
     salience_config: SalienceConfig,
     start_time: Instant,
     extraction_pipeline: Option<crate::extraction::pipeline::ExtractionPipeline>,
+    qi_expansion_provider: Option<Arc<dyn crate::query_intelligence::QueryIntelligenceProvider + Send + Sync>>,
+    qi_reranking_provider: Option<Arc<dyn crate::query_intelligence::QueryIntelligenceProvider + Send + Sync>>,
+    qi_config: crate::config::QueryIntelligenceConfig,
 }
 
 impl MemoryService {
@@ -44,6 +47,9 @@ impl MemoryService {
         pg_store: Option<Arc<crate::store::postgres::PostgresMemoryStore>>,
         salience_config: SalienceConfig,
         extraction_pipeline: Option<crate::extraction::pipeline::ExtractionPipeline>,
+        qi_expansion_provider: Option<Arc<dyn crate::query_intelligence::QueryIntelligenceProvider + Send + Sync>>,
+        qi_reranking_provider: Option<Arc<dyn crate::query_intelligence::QueryIntelligenceProvider + Send + Sync>>,
+        qi_config: crate::config::QueryIntelligenceConfig,
     ) -> Self {
         Self {
             store,
@@ -53,6 +59,9 @@ impl MemoryService {
             salience_config,
             start_time: Instant::now(),
             extraction_pipeline,
+            qi_expansion_provider,
+            qi_reranking_provider,
+            qi_config,
         }
     }
 
