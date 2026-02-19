@@ -163,6 +163,15 @@ pub struct SearchMemoryParams {
     pub tags: Option<Vec<String>>,
     /// Cursor from previous page for pagination (optional)
     pub cursor: Option<String>,
+    /// Weight for BM25 keyword search path (0.0 to disable, 1.0 = default, >1.0 = emphasize).
+    /// Controls how much exact keyword matches influence results.
+    pub bm25_weight: Option<f64>,
+    /// Weight for vector semantic search path (0.0 to disable, 1.0 = default, >1.0 = emphasize).
+    /// Controls how much meaning similarity influences results.
+    pub vector_weight: Option<f64>,
+    /// Weight for symbolic metadata search path (0.0 to disable, 1.0 = default, >1.0 = emphasize).
+    /// Controls how much tag/type/source matches influence results.
+    pub symbolic_weight: Option<f64>,
 }
 
 // Helper: convert MemcpError to CallToolResult with isError: true
@@ -673,7 +682,39 @@ impl MemoryService {
             None
         };
 
-        // 6. Call hybrid_search — BM25 + vector with RRF fusion
+        // 6. Convert weight params to per-leg k values for RRF fusion.
+        //    Formula: k = base_k / weight (lower k = more top-result influence).
+        //    weight=0.0 → None (skip leg entirely).
+        //    weight=None → default k (1.0 = no change to base_k).
+        const BM25_BASE_K: f64 = 60.0;
+        const VECTOR_BASE_K: f64 = 60.0;
+        const SYMBOLIC_BASE_K: f64 = 40.0;
+
+        let bm25_k = match params.bm25_weight {
+            Some(w) if w == 0.0 => None,          // disabled
+            Some(w) => Some(BM25_BASE_K / w),     // weight=2.0 → k=30.0 (stronger influence)
+            None => Some(BM25_BASE_K),             // default
+        };
+        let vector_k = match params.vector_weight {
+            Some(w) if w == 0.0 => None,
+            Some(w) => Some(VECTOR_BASE_K / w),
+            None => Some(VECTOR_BASE_K),
+        };
+        let symbolic_k = match params.symbolic_weight {
+            Some(w) if w == 0.0 => None,
+            Some(w) => Some(SYMBOLIC_BASE_K / w),
+            None => Some(SYMBOLIC_BASE_K),
+        };
+
+        // Validate that at least one search path is enabled
+        if bm25_k.is_none() && vector_k.is_none() && symbolic_k.is_none() {
+            return Ok(CallToolResult::structured_error(json!({
+                "isError": true,
+                "error": "At least one search path must be enabled (bm25_weight, vector_weight, or symbolic_weight must be non-zero)",
+            })));
+        }
+
+        // 7. Call hybrid_search — BM25 + vector + symbolic with three-way RRF fusion.
         // Note: cursor-based pagination not applied at this level; salience re-ranking
         // must happen on the full result set before we can paginate meaningfully.
         let tags_slice: Option<Vec<String>> = params.tags.clone();
@@ -684,6 +725,9 @@ impl MemoryService {
             created_after,
             created_before,
             tags_slice.as_deref(),
+            bm25_k,
+            vector_k,
+            symbolic_k,
         ).await {
             Ok(hits) => hits,
             Err(e) => return Ok(store_error_to_result(e)),
