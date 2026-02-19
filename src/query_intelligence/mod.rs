@@ -6,6 +6,8 @@
 /// Both features are disabled by default — set expansion_enabled or reranking_enabled
 /// in QueryIntelligenceConfig to opt in.
 
+pub mod ollama;
+pub mod openai;
 pub mod temporal;
 
 use async_trait::async_trait;
