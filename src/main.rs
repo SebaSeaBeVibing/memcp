@@ -7,6 +7,11 @@ use memcp::embedding::EmbeddingProvider;
 use memcp::embedding::local::LocalEmbeddingProvider;
 use memcp::embedding::openai::OpenAIEmbeddingProvider;
 use memcp::embedding::pipeline::{EmbeddingPipeline, backfill};
+use memcp::extraction::ExtractionJob;
+use memcp::extraction::ExtractionProvider;
+use memcp::extraction::ollama::OllamaExtractionProvider;
+use memcp::extraction::openai::OpenAIExtractionProvider;
+use memcp::extraction::pipeline::ExtractionPipeline;
 use memcp::logging;
 use memcp::server::MemoryService;
 use memcp::store::postgres::PostgresMemoryStore;
@@ -49,6 +54,31 @@ enum EmbedAction {
         #[arg(long)]
         dry_run: bool,
     },
+}
+
+/// Create the extraction provider based on configuration.
+fn create_extraction_provider(config: &Config) -> Result<Arc<dyn ExtractionProvider + Send + Sync>> {
+    match config.extraction.provider.as_str() {
+        "openai" => {
+            let api_key = config.extraction.openai_api_key.clone()
+                .ok_or_else(|| anyhow::anyhow!(
+                    "OpenAI API key required when extraction provider is 'openai'. \
+                     Set MEMCP_EXTRACTION__OPENAI_API_KEY or extraction.openai_api_key in memcp.toml"
+                ))?;
+            Ok(Arc::new(OpenAIExtractionProvider::new(
+                api_key,
+                config.extraction.openai_model.clone(),
+                config.extraction.max_content_chars,
+            )?))
+        }
+        "ollama" | _ => {
+            Ok(Arc::new(OllamaExtractionProvider::new(
+                config.extraction.ollama_base_url.clone(),
+                config.extraction.ollama_model.clone(),
+                config.extraction.max_content_chars,
+            )))
+        }
+    }
 }
 
 /// Create the embedding provider based on configuration.
@@ -170,7 +200,43 @@ async fn main() -> Result<()> {
                 tracing::info!(count = queued, "Startup backfill queued memories for embedding");
             }
 
-            // 8. Create service with store, pipeline, embedding provider, and salience config
+            // 8. Create extraction pipeline if enabled
+            let extraction_pipeline = if config.extraction.enabled {
+                match create_extraction_provider(&config) {
+                    Ok(extraction_provider) => {
+                        let ep = ExtractionPipeline::new(extraction_provider, store.clone(), 1000);
+                        // Queue pending extractions on startup (backfill)
+                        match store.get_pending_extraction(1000).await {
+                            Ok(pending) => {
+                                let count = pending.len();
+                                for (memory_id, content) in pending {
+                                    ep.enqueue(ExtractionJob {
+                                        memory_id,
+                                        content,
+                                        attempt: 0,
+                                    });
+                                }
+                                if count > 0 {
+                                    tracing::info!(count = count, "Startup backfill queued memories for extraction");
+                                }
+                            }
+                            Err(e) => {
+                                tracing::warn!(error = %e, "Failed to fetch pending extractions for backfill");
+                            }
+                        }
+                        Some(ep)
+                    }
+                    Err(e) => {
+                        tracing::warn!(error = %e, "Failed to initialize extraction provider — extraction disabled");
+                        None
+                    }
+                }
+            } else {
+                tracing::info!("Extraction disabled via config (extraction.enabled=false)");
+                None
+            };
+
+            // 9. Create service with store, pipeline, embedding provider, salience config, and extraction pipeline
             let pg_store_for_search = store.clone();
             let service = MemoryService::new(
                 store as Arc<dyn memcp::store::MemoryStore + Send + Sync>,
@@ -178,15 +244,16 @@ async fn main() -> Result<()> {
                 Some(provider_for_search),
                 Some(pg_store_for_search),
                 config.salience.clone(),
+                extraction_pipeline,
             );
 
-            // 9. Serve via stdio transport
+            // 10. Serve via stdio transport
             let (stdin, stdout) = rmcp::transport::io::stdio();
             let server = service.serve((stdin, stdout)).await?;
 
             tracing::info!("memcp server running — awaiting tool calls via stdio");
 
-            // 10. Wait for shutdown (client disconnects or signal)
+            // 11. Wait for shutdown (client disconnects or signal)
             server.waiting().await?;
 
             tracing::info!("memcp server stopped");

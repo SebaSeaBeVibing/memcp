@@ -21,6 +21,7 @@ use chrono::Utc;
 use crate::config::SalienceConfig;
 use crate::embedding::{EmbeddingJob, EmbeddingProvider};
 use crate::errors::MemcpError;
+use crate::extraction::ExtractionJob;
 use crate::search::{SalienceScorer, ScoredHit};
 use crate::search::salience::SalienceInput;
 use crate::store::{CreateMemory, ListFilter, Memory, MemoryStore, UpdateMemory};
@@ -32,6 +33,7 @@ pub struct MemoryService {
     pg_store: Option<Arc<crate::store::postgres::PostgresMemoryStore>>,
     salience_config: SalienceConfig,
     start_time: Instant,
+    extraction_pipeline: Option<crate::extraction::pipeline::ExtractionPipeline>,
 }
 
 impl MemoryService {
@@ -41,6 +43,7 @@ impl MemoryService {
         embedding_provider: Option<Arc<dyn EmbeddingProvider>>,
         pg_store: Option<Arc<crate::store::postgres::PostgresMemoryStore>>,
         salience_config: SalienceConfig,
+        extraction_pipeline: Option<crate::extraction::pipeline::ExtractionPipeline>,
     ) -> Self {
         Self {
             store,
@@ -49,6 +52,7 @@ impl MemoryService {
             pg_store,
             salience_config,
             start_time: Instant::now(),
+            extraction_pipeline,
         }
     }
 
@@ -263,6 +267,14 @@ impl MemoryService {
                         attempt: 0,
                     });
                 }
+                // Enqueue background extraction job (non-blocking)
+                if let Some(ref extraction_pipeline) = self.extraction_pipeline {
+                    extraction_pipeline.enqueue(ExtractionJob {
+                        memory_id: memory.id.clone(),
+                        content: memory.content.clone(),
+                        attempt: 0,
+                    });
+                }
                 Ok(CallToolResult::structured(json!({
                     "id": memory.id,
                     "content": memory.content,
@@ -383,6 +395,26 @@ impl MemoryService {
                         pipeline.enqueue(EmbeddingJob {
                             memory_id: memory.id.clone(),
                             text,
+                            attempt: 0,
+                        });
+                    }
+                }
+                // Re-extract when content changes (extraction is content-only, not tags)
+                if content_changed {
+                    if let Some(ref extraction_pipeline) = self.extraction_pipeline {
+                        // Reset extraction status to pending, then enqueue
+                        if let Some(ref pg_store) = self.pg_store {
+                            let store = pg_store.clone();
+                            let id = memory.id.clone();
+                            tokio::spawn(async move {
+                                if let Err(e) = store.update_extraction_status(&id, "pending").await {
+                                    tracing::warn!("Failed to reset extraction status for {}: {}", id, e);
+                                }
+                            });
+                        }
+                        extraction_pipeline.enqueue(ExtractionJob {
+                            memory_id: memory.id.clone(),
+                            content: memory.content.clone(),
                             attempt: 0,
                         });
                     }
