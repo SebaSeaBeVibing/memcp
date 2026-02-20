@@ -1,0 +1,6 @@
+/target
+*.db
+*.db-shm
+*.db-wal
+.fastembed_cache/
+data/longmemeval/
