@@ -168,6 +168,9 @@ fn decode_cursor(cursor: &str) -> Result<(DateTime<Utc>, String), MemcpError> {
 /// PostgreSQL native types map directly:
 /// - TIMESTAMPTZ -> DateTime<Utc> (no string parsing)
 /// - JSONB -> Option<serde_json::Value> (no string parsing)
+///
+/// New extraction and consolidation columns are read with defaults when absent
+/// (e.g., rows from JOIN queries that don't select these columns).
 fn row_to_memory(row: &PgRow) -> Result<Memory, MemcpError> {
     Ok(Memory {
         id: row.try_get("id").map_err(|e| MemcpError::Storage(e.to_string()))?,
@@ -180,6 +183,11 @@ fn row_to_memory(row: &PgRow) -> Result<Memory, MemcpError> {
         last_accessed_at: row.try_get("last_accessed_at").map_err(|e| MemcpError::Storage(e.to_string()))?,
         access_count: row.try_get("access_count").map_err(|e| MemcpError::Storage(e.to_string()))?,
         embedding_status: row.try_get("embedding_status").map_err(|e| MemcpError::Storage(e.to_string()))?,
+        extracted_entities: row.try_get("extracted_entities").unwrap_or(None),
+        extracted_facts: row.try_get("extracted_facts").unwrap_or(None),
+        extraction_status: row.try_get("extraction_status").unwrap_or_else(|_| "pending".to_string()),
+        is_consolidated_original: row.try_get("is_consolidated_original").unwrap_or(false),
+        consolidated_into: row.try_get("consolidated_into").unwrap_or(None),
     })
 }
 
@@ -221,12 +229,18 @@ impl MemoryStore for PostgresMemoryStore {
             last_accessed_at: None,
             access_count: 0,
             embedding_status: "pending".to_string(),
+            extracted_entities: None,
+            extracted_facts: None,
+            extraction_status: "pending".to_string(),
+            is_consolidated_original: false,
+            consolidated_into: None,
         })
     }
 
     async fn get(&self, id: &str) -> Result<Memory, MemcpError> {
         let row = sqlx::query(
-            "SELECT id, content, type_hint, source, tags, created_at, updated_at, last_accessed_at, access_count, embedding_status \
+            "SELECT id, content, type_hint, source, tags, created_at, updated_at, last_accessed_at, access_count, embedding_status, \
+             extracted_entities, extracted_facts, extraction_status, is_consolidated_original, consolidated_into \
              FROM memories WHERE id = $1",
         )
         .bind(id)
@@ -311,7 +325,8 @@ impl MemoryStore for PostgresMemoryStore {
 
         // Re-fetch and return the updated record
         let updated_row = sqlx::query(
-            "SELECT id, content, type_hint, source, tags, created_at, updated_at, last_accessed_at, access_count, embedding_status \
+            "SELECT id, content, type_hint, source, tags, created_at, updated_at, last_accessed_at, access_count, embedding_status, \
+             extracted_entities, extracted_facts, extraction_status, is_consolidated_original, consolidated_into \
              FROM memories WHERE id = $1",
         )
         .bind(id)
@@ -388,7 +403,8 @@ impl MemoryStore for PostgresMemoryStore {
         };
 
         let sql = format!(
-            "SELECT id, content, type_hint, source, tags, created_at, updated_at, last_accessed_at, access_count, embedding_status \
+            "SELECT id, content, type_hint, source, tags, created_at, updated_at, last_accessed_at, access_count, embedding_status, \
+             extracted_entities, extracted_facts, extraction_status, is_consolidated_original, consolidated_into \
              FROM memories {} ORDER BY created_at DESC, id ASC LIMIT ${}",
             where_clause, param_idx
         );
@@ -644,7 +660,8 @@ impl PostgresMemoryStore {
     /// Retrieve memories that need embedding (status 'pending' or 'failed'), ordered oldest first.
     pub async fn get_pending_memories(&self, limit: i64) -> Result<Vec<crate::store::Memory>, MemcpError> {
         let rows = sqlx::query(
-            "SELECT id, content, type_hint, source, tags, created_at, updated_at, last_accessed_at, access_count, embedding_status \
+            "SELECT id, content, type_hint, source, tags, created_at, updated_at, last_accessed_at, access_count, embedding_status, \
+             extracted_entities, extracted_facts, extraction_status, is_consolidated_original, consolidated_into \
              FROM memories WHERE embedding_status IN ('pending', 'failed') \
              ORDER BY created_at ASC LIMIT $1",
         )
@@ -1019,14 +1036,17 @@ impl PostgresMemoryStore {
 
         // Main search query: JOIN memories with embeddings, compute cosine similarity,
         // ORDER BY distance ASC (NOT alias) so HNSW index is used.
+        // Suppress consolidated originals from search results.
         let sql = format!(
             "SELECT m.id, m.content, m.type_hint, m.source, m.tags, \
                     m.created_at, m.updated_at, m.last_accessed_at, \
                     m.access_count, m.embedding_status, \
+                    m.extracted_entities, m.extracted_facts, m.extraction_status, \
+                    m.is_consolidated_original, m.consolidated_into, \
                     (1 - (me.embedding <=> $1)) AS similarity \
              FROM memories m \
              JOIN memory_embeddings me ON me.memory_id = m.id \
-             {} \
+             {} AND m.is_consolidated_original = FALSE \
              ORDER BY me.embedding <=> $1 ASC \
              LIMIT ${} OFFSET ${}",
             where_clause, param_idx, param_idx + 1
@@ -1037,7 +1057,7 @@ impl PostgresMemoryStore {
             "SELECT COUNT(*) as total \
              FROM memories m \
              JOIN memory_embeddings me ON me.memory_id = m.id \
-             {}",
+             {} AND m.is_consolidated_original = FALSE",
             where_clause
         );
 
@@ -1128,7 +1148,8 @@ impl PostgresMemoryStore {
 
         let rows = sqlx::query(
             "SELECT id, content, type_hint, source, tags, created_at, updated_at, \
-             last_accessed_at, access_count, embedding_status \
+             last_accessed_at, access_count, embedding_status, \
+             extracted_entities, extracted_facts, extraction_status, is_consolidated_original, consolidated_into \
              FROM memories WHERE id = ANY($1)",
         )
         .bind(ids)
@@ -1144,11 +1165,15 @@ impl PostgresMemoryStore {
         Ok(map)
     }
 
-    /// Orchestrate hybrid BM25 + vector search with RRF fusion.
+    /// Orchestrate hybrid BM25 + vector + symbolic search with three-way RRF fusion.
     ///
-    /// Both legs run independently with a candidate pool of 40 results each.
+    /// All three legs run independently with a candidate pool of 40 results each.
     /// When query_embedding is None (embedding provider unavailable), gracefully
-    /// falls back to BM25-only results.
+    /// falls back to BM25 + symbolic search only.
+    ///
+    /// Per-leg k overrides control RRF smoothing (lower k = more top-result influence):
+    /// - None means "skip this leg entirely"
+    /// - Some(k) means "run with this k value" (default: bm25=60.0, vector=60.0, symbolic=40.0)
     ///
     /// Salience re-ranking is NOT performed here — the server layer applies it
     /// after fetching salience data from the database.
@@ -1160,37 +1185,65 @@ impl PostgresMemoryStore {
         created_after: Option<chrono::DateTime<Utc>>,
         created_before: Option<chrono::DateTime<Utc>>,
         tags: Option<&[String]>,
+        bm25_k: Option<f64>,
+        vector_k: Option<f64>,
+        symbolic_k: Option<f64>,
     ) -> Result<Vec<crate::search::HybridRawHit>, MemcpError> {
         // 40 candidates per leg — research recommendation balancing recall vs cost
         let candidate_limit = 40i64;
 
-        // BM25 leg — always runs (no embedding dependency)
-        let bm25_results = self.search_bm25(query_text, candidate_limit).await?;
-
-        // Vector leg — only runs when query embedding is available (graceful degradation)
-        let vector_results: Vec<(String, i64)> = if let Some(embedding) = query_embedding {
-            let filter = SearchFilter {
-                query_embedding: embedding.clone(),
-                limit: candidate_limit,
-                offset: 0,
-                created_after,
-                created_before,
-                tags: tags.map(|t| t.to_vec()),
-            };
-            let result = self.search_similar(&filter).await?;
-            result
-                .hits
-                .iter()
-                .enumerate()
-                .map(|(i, hit)| (hit.memory.id.clone(), (i + 1) as i64))
-                .collect()
+        // BM25 leg — skip when bm25_k is None (weight=0.0 = disabled)
+        let bm25_results: Vec<(String, i64)> = if bm25_k.is_some() {
+            self.search_bm25(query_text, candidate_limit).await?
         } else {
-            tracing::info!("No query embedding available — falling back to BM25-only search");
+            tracing::info!("BM25 search leg disabled (bm25_weight=0.0)");
             vec![]
         };
 
-        // RRF fusion with k=60 (research default)
-        let fused = crate::search::rrf_fuse(&bm25_results, &vector_results, 60.0);
+        // Vector leg — only runs when query embedding is available AND vector_k is Some
+        let vector_results: Vec<(String, i64)> = if vector_k.is_some() {
+            if let Some(embedding) = query_embedding {
+                let filter = SearchFilter {
+                    query_embedding: embedding.clone(),
+                    limit: candidate_limit,
+                    offset: 0,
+                    created_after,
+                    created_before,
+                    tags: tags.map(|t| t.to_vec()),
+                };
+                let result = self.search_similar(&filter).await?;
+                result
+                    .hits
+                    .iter()
+                    .enumerate()
+                    .map(|(i, hit)| (hit.memory.id.clone(), (i + 1) as i64))
+                    .collect()
+            } else {
+                tracing::info!("No query embedding available — skipping vector search leg");
+                vec![]
+            }
+        } else {
+            tracing::info!("Vector search leg disabled (vector_weight=0.0)");
+            vec![]
+        };
+
+        // Symbolic leg — skip when symbolic_k is None (weight=0.0 = disabled)
+        let symbolic_results: Vec<(String, i64)> = if symbolic_k.is_some() {
+            self.search_symbolic(query_text, candidate_limit).await?
+        } else {
+            tracing::info!("Symbolic search leg disabled (symbolic_weight=0.0)");
+            vec![]
+        };
+
+        // Three-way RRF fusion with per-leg k parameters
+        let fused = crate::search::rrf_fuse(
+            &bm25_results,
+            &vector_results,
+            &symbolic_results,
+            bm25_k.unwrap_or(60.0),
+            vector_k.unwrap_or(60.0),
+            symbolic_k.unwrap_or(40.0),
+        );
 
         // Fetch full Memory objects for the top fused IDs
         let top_ids: Vec<String> = fused
@@ -1215,6 +1268,61 @@ impl PostgresMemoryStore {
         Ok(hits)
     }
 
+    /// Search for memories matching query terms against symbolic metadata fields.
+    ///
+    /// Matches against: tags, extracted_entities, extracted_facts (JSONB containment),
+    /// type_hint and source (ILIKE). Results scored by match strength, returned as
+    /// (memory_id, symbolic_rank) pairs ordered by rank ascending (1 = best match).
+    ///
+    /// Suppresses consolidated originals from results (is_consolidated_original = FALSE).
+    pub async fn search_symbolic(
+        &self,
+        query: &str,
+        limit: i64,
+    ) -> Result<Vec<(String, i64)>, MemcpError> {
+        // Build JSONB array for containment matching: ["query term"]
+        // This matches tags/entities/facts that contain the query string as an element.
+        let query_jsonb = serde_json::json!([query]);
+        // ILIKE pattern for type_hint and source matching
+        let ilike_pattern = format!("%{}%", query);
+
+        let sql = "SELECT id, ROW_NUMBER() OVER (ORDER BY score DESC) AS symbolic_rank
+            FROM (
+                SELECT id,
+                    (CASE WHEN tags @> $1::jsonb THEN 3 ELSE 0 END
+                     + CASE WHEN extracted_entities @> $1::jsonb THEN 2 ELSE 0 END
+                     + CASE WHEN extracted_facts @> $1::jsonb THEN 2 ELSE 0 END
+                     + CASE WHEN type_hint ILIKE $2 THEN 1 ELSE 0 END
+                     + CASE WHEN source ILIKE $2 THEN 1 ELSE 0 END) AS score
+                FROM memories
+                WHERE is_consolidated_original = FALSE
+                  AND (
+                    tags @> $1::jsonb
+                    OR extracted_entities @> $1::jsonb
+                    OR extracted_facts @> $1::jsonb
+                    OR type_hint ILIKE $2
+                    OR source ILIKE $2
+                  )
+            ) ranked
+            WHERE score > 0
+            ORDER BY symbolic_rank
+            LIMIT $3";
+
+        let rows = sqlx::query(sql)
+            .bind(&query_jsonb)
+            .bind(&ilike_pattern)
+            .bind(limit)
+            .fetch_all(&self.pool)
+            .await
+            .map_err(|e| MemcpError::Storage(format!("Symbolic search failed: {}", e)))?;
+
+        rows.iter().map(|row| {
+            let id: String = row.try_get("id").map_err(|e| MemcpError::Storage(e.to_string()))?;
+            let rank: i64 = row.try_get("symbolic_rank").map_err(|e| MemcpError::Storage(e.to_string()))?;
+            Ok((id, rank))
+        }).collect::<Result<Vec<_>, MemcpError>>()
+    }
+
     /// Search for memories matching the query using BM25 full-text ranking.
     ///
     /// Uses native PostgreSQL tsvector/ts_rank_cd by default. When use_paradedb is true
@@ -1236,6 +1344,7 @@ impl PostgresMemoryStore {
             ) AS bm25_rank
             FROM memories
             WHERE content @@@ $1
+              AND is_consolidated_original = FALSE
             ORDER BY bm25_rank
             LIMIT $2"
         } else {
@@ -1249,6 +1358,7 @@ impl PostgresMemoryStore {
             ) AS bm25_rank
             FROM memories
             WHERE to_tsvector('english', content) @@ plainto_tsquery('english', $1)
+              AND is_consolidated_original = FALSE
             ORDER BY bm25_rank
             LIMIT $2"
         };
@@ -1265,5 +1375,186 @@ impl PostgresMemoryStore {
             let rank: i64 = row.try_get("bm25_rank").map_err(|e| MemcpError::Storage(e.to_string()))?;
             Ok((id, rank))
         }).collect::<Result<Vec<_>, MemcpError>>()
+    }
+
+    // -------------------------------------------------------------------------
+    // Extraction pipeline support methods
+    // -------------------------------------------------------------------------
+
+    /// Store extraction results (entities and facts) for a memory.
+    ///
+    /// Updates the extracted_entities and extracted_facts JSONB columns.
+    /// Called by the extraction pipeline after successful entity/fact extraction.
+    pub async fn update_extraction_results(
+        &self,
+        memory_id: &str,
+        entities: &[String],
+        facts: &[String],
+    ) -> Result<(), MemcpError> {
+        let entities_json = serde_json::json!(entities);
+        let facts_json = serde_json::json!(facts);
+
+        sqlx::query(
+            "UPDATE memories SET extracted_entities = $2, extracted_facts = $3 WHERE id = $1",
+        )
+        .bind(memory_id)
+        .bind(&entities_json)
+        .bind(&facts_json)
+        .execute(&self.pool)
+        .await
+        .map_err(|e| MemcpError::Storage(format!("Failed to update extraction results: {}", e)))?;
+
+        Ok(())
+    }
+
+    /// Update the extraction_status column for a memory.
+    ///
+    /// Valid statuses: "pending", "complete", "failed".
+    pub async fn update_extraction_status(
+        &self,
+        memory_id: &str,
+        status: &str,
+    ) -> Result<(), MemcpError> {
+        sqlx::query("UPDATE memories SET extraction_status = $2 WHERE id = $1")
+            .bind(memory_id)
+            .bind(status)
+            .execute(&self.pool)
+            .await
+            .map_err(|e| MemcpError::Storage(format!("Failed to update extraction status: {}", e)))?;
+
+        Ok(())
+    }
+
+    /// Fetch memories with pending extraction status for backfill.
+    ///
+    /// Returns (id, content) pairs for queuing into the extraction pipeline.
+    pub async fn get_pending_extraction(
+        &self,
+        limit: i64,
+    ) -> Result<Vec<(String, String)>, MemcpError> {
+        let rows = sqlx::query(
+            "SELECT id, content FROM memories WHERE extraction_status = 'pending' LIMIT $1",
+        )
+        .bind(limit)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|e| MemcpError::Storage(format!("Failed to fetch pending extractions: {}", e)))?;
+
+        rows.iter()
+            .map(|row| {
+                let id: String = row.try_get("id").map_err(|e| MemcpError::Storage(e.to_string()))?;
+                let content: String = row.try_get("content").map_err(|e| MemcpError::Storage(e.to_string()))?;
+                Ok((id, content))
+            })
+            .collect::<Result<Vec<_>, MemcpError>>()
+    }
+
+    // -------------------------------------------------------------------------
+    // Consolidation pipeline support methods
+    // -------------------------------------------------------------------------
+
+    /// Atomically create a consolidated memory and link its originals.
+    ///
+    /// Runs in a single database transaction:
+    /// 1. INSERT a new memory row with `type_hint='consolidated'`, `source='consolidation'`.
+    /// 2. For each source_id: INSERT into `memory_consolidations` with similarity score.
+    /// 3. For each source_id: UPDATE memories SET `is_consolidated_original=TRUE`, `consolidated_into=id`.
+    ///
+    /// The UNIQUE constraint on (consolidated_id, original_id) prevents race conditions —
+    /// concurrent workers attempting the same consolidation will get a duplicate key error,
+    /// which the caller should handle gracefully by ignoring the violation.
+    ///
+    /// Returns the new consolidated memory's ID.
+    pub async fn create_consolidated_memory(
+        &self,
+        content: &str,
+        source_ids: &[String],
+        similarities: &[f64],
+    ) -> Result<String, MemcpError> {
+        let consolidated_id = Uuid::new_v4().to_string();
+        let now = Utc::now();
+
+        // Start a database transaction for atomic create + link + mark
+        let mut tx = self.pool.begin().await.map_err(|e| {
+            MemcpError::Storage(format!("Failed to begin consolidation transaction: {}", e))
+        })?;
+
+        // 1. Insert the consolidated memory row
+        sqlx::query(
+            "INSERT INTO memories \
+             (id, content, type_hint, source, created_at, updated_at, access_count, \
+              embedding_status, extraction_status) \
+             VALUES ($1, $2, 'consolidated', 'consolidation', $3, $3, 0, 'pending', 'pending')",
+        )
+        .bind(&consolidated_id)
+        .bind(content)
+        .bind(&now)
+        .execute(&mut *tx)
+        .await
+        .map_err(|e| MemcpError::Storage(format!("Failed to insert consolidated memory: {}", e)))?;
+
+        // 2. Insert consolidation provenance records + mark originals
+        for (source_id, &similarity) in source_ids.iter().zip(similarities.iter()) {
+            let link_id = Uuid::new_v4().to_string();
+
+            // Insert memory_consolidations record
+            sqlx::query(
+                "INSERT INTO memory_consolidations \
+                 (id, consolidated_id, original_id, similarity_score, created_at) \
+                 VALUES ($1, $2, $3, $4, $5)",
+            )
+            .bind(&link_id)
+            .bind(&consolidated_id)
+            .bind(source_id)
+            .bind(similarity as f32)  // REAL column — use f32
+            .bind(&now)
+            .execute(&mut *tx)
+            .await
+            .map_err(|e| MemcpError::Storage(format!("Failed to insert consolidation link: {}", e)))?;
+
+            // Mark original as consolidated
+            sqlx::query(
+                "UPDATE memories SET is_consolidated_original = TRUE, consolidated_into = $1 \
+                 WHERE id = $2",
+            )
+            .bind(&consolidated_id)
+            .bind(source_id)
+            .execute(&mut *tx)
+            .await
+            .map_err(|e| MemcpError::Storage(format!("Failed to mark original as consolidated: {}", e)))?;
+        }
+
+        // Commit the transaction atomically
+        tx.commit().await.map_err(|e| {
+            MemcpError::Storage(format!("Failed to commit consolidation transaction: {}", e))
+        })?;
+
+        Ok(consolidated_id)
+    }
+
+    /// Fetch the current embedding vector for a memory.
+    ///
+    /// Returns None if no current embedding exists (not yet embedded, or embedding was staled).
+    pub async fn get_memory_embedding(
+        &self,
+        memory_id: &str,
+    ) -> Result<Option<pgvector::Vector>, MemcpError> {
+        let row = sqlx::query(
+            "SELECT embedding FROM memory_embeddings WHERE memory_id = $1 AND is_current = TRUE",
+        )
+        .bind(memory_id)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(|e| MemcpError::Storage(format!("Failed to fetch memory embedding: {}", e)))?;
+
+        match row {
+            None => Ok(None),
+            Some(r) => {
+                let embedding: pgvector::Vector = r
+                    .try_get("embedding")
+                    .map_err(|e| MemcpError::Storage(e.to_string()))?;
+                Ok(Some(embedding))
+            }
+        }
     }
 }

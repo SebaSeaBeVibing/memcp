@@ -36,6 +36,16 @@ pub struct Memory {
     /// Embedding generation status: "pending", "complete", or "failed"
     /// Use EmbeddingStatus enum (in embedding module) for type-safe pipeline logic.
     pub embedding_status: String,
+    /// Extracted named entities from content (JSONB array of strings, populated by extraction pipeline)
+    pub extracted_entities: Option<serde_json::Value>,
+    /// Extracted facts from content (JSONB array of strings, populated by extraction pipeline)
+    pub extracted_facts: Option<serde_json::Value>,
+    /// Extraction pipeline status: "pending", "complete", "failed", "skipped"
+    pub extraction_status: String,
+    /// When true, this memory was superseded by consolidation — suppress from search results
+    pub is_consolidated_original: bool,
+    /// ID of the consolidated memory this was merged into (None if not consolidated)
+    pub consolidated_into: Option<String>,
 }
 
 /// Input type for creating a new memory.

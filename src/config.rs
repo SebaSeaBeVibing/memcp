@@ -86,6 +86,120 @@ impl Default for SalienceConfig {
     }
 }
 
+/// Configuration for the extraction pipeline subsystem.
+///
+/// Provider selection is explicit — "ollama" is the default (local, no API key needed).
+/// Nested env var overrides use double underscores:
+///   MEMCP_EXTRACTION__PROVIDER=openai
+///   MEMCP_EXTRACTION__OPENAI_API_KEY=sk-...
+///   MEMCP_EXTRACTION__ENABLED=false
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ExtractionConfig {
+    /// Which provider to use: "ollama" (local, default) or "openai"
+    #[serde(default = "default_extraction_provider")]
+    pub provider: String,
+
+    /// Ollama server base URL
+    #[serde(default = "default_ollama_base_url")]
+    pub ollama_base_url: String,
+
+    /// Ollama model for extraction
+    #[serde(default = "default_ollama_model")]
+    pub ollama_model: String,
+
+    /// OpenAI API key — only required when provider = "openai"
+    #[serde(default)]
+    pub openai_api_key: Option<String>,
+
+    /// OpenAI model for extraction
+    #[serde(default = "default_openai_extraction_model")]
+    pub openai_model: String,
+
+    /// Whether extraction is enabled (default: true). Set to false to skip extraction entirely.
+    #[serde(default = "default_extraction_enabled")]
+    pub enabled: bool,
+
+    /// Maximum content characters to send for extraction (truncated beyond this)
+    #[serde(default = "default_max_content_chars")]
+    pub max_content_chars: usize,
+}
+
+fn default_extraction_provider() -> String {
+    "ollama".to_string()
+}
+
+fn default_ollama_base_url() -> String {
+    "http://localhost:11434".to_string()
+}
+
+fn default_ollama_model() -> String {
+    "llama3.2:3b".to_string()
+}
+
+fn default_openai_extraction_model() -> String {
+    "gpt-4o-mini".to_string()
+}
+
+fn default_extraction_enabled() -> bool {
+    true
+}
+
+fn default_max_content_chars() -> usize {
+    1500
+}
+
+impl Default for ExtractionConfig {
+    fn default() -> Self {
+        ExtractionConfig {
+            provider: default_extraction_provider(),
+            ollama_base_url: default_ollama_base_url(),
+            ollama_model: default_ollama_model(),
+            openai_api_key: None,
+            openai_model: default_openai_extraction_model(),
+            enabled: default_extraction_enabled(),
+            max_content_chars: default_max_content_chars(),
+        }
+    }
+}
+
+/// Configuration for the memory consolidation subsystem.
+///
+/// When enabled, new memories trigger a pgvector similarity check after embedding.
+/// If any existing memories exceed the threshold, they are auto-merged via LLM synthesis.
+/// Nested env var overrides use double underscores:
+///   MEMCP_CONSOLIDATION__ENABLED=false
+///   MEMCP_CONSOLIDATION__SIMILARITY_THRESHOLD=0.92
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ConsolidationConfig {
+    /// Whether consolidation is enabled (default: true).
+    /// Set to false to disable automatic merging.
+    #[serde(default = "default_consolidation_enabled")]
+    pub enabled: bool,
+
+    /// Cosine similarity threshold above which memories are merged (default: 0.92).
+    /// Range: 0.0–1.0. Higher values require tighter similarity before merging.
+    #[serde(default = "default_similarity_threshold")]
+    pub similarity_threshold: f64,
+
+    /// Maximum number of originals merged into a single consolidated memory (default: 5).
+    #[serde(default = "default_max_consolidation_group")]
+    pub max_consolidation_group: usize,
+}
+
+fn default_consolidation_enabled() -> bool { true }
+fn default_similarity_threshold() -> f64 { 0.92 }
+fn default_max_consolidation_group() -> usize { 5 }
+
+impl Default for ConsolidationConfig {
+    fn default() -> Self {
+        ConsolidationConfig {
+            enabled: default_consolidation_enabled(),
+            similarity_threshold: default_similarity_threshold(),
+            max_consolidation_group: default_max_consolidation_group(),
+        }
+    }
+}
+
 /// Configuration for the embedding provider subsystem.
 ///
 /// Provider selection is explicit — having an API key does NOT auto-switch from local.
@@ -158,6 +272,16 @@ pub struct Config {
     /// Existing configs without [salience] section still work (serde default applied).
     #[serde(default)]
     pub salience: SalienceConfig,
+
+    /// Extraction pipeline configuration.
+    /// Existing configs without [extraction] section still work (serde default applied).
+    #[serde(default)]
+    pub extraction: ExtractionConfig,
+
+    /// Memory consolidation configuration.
+    /// Existing configs without [consolidation] section still work (serde default applied).
+    #[serde(default)]
+    pub consolidation: ConsolidationConfig,
 }
 
 fn default_log_level() -> String {
@@ -177,6 +301,8 @@ impl Default for Config {
             embedding: EmbeddingConfig::default(),
             search: SearchConfig::default(),
             salience: SalienceConfig::default(),
+            extraction: ExtractionConfig::default(),
+            consolidation: ConsolidationConfig::default(),
         }
     }
 }

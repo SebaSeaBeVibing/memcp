@@ -1,6 +1,8 @@
 pub mod config;
+pub mod consolidation;
 pub mod embedding;
 pub mod errors;
+pub mod extraction;
 pub mod logging;
 pub mod search;
 pub mod server;
