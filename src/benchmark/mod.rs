@@ -7,6 +7,7 @@ pub mod dataset;
 pub mod evaluate;
 pub mod ingest;
 pub mod prompts;
+pub mod runner;
 
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
