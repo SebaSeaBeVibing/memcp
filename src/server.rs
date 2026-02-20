@@ -14,9 +14,10 @@ use serde::{Deserialize, Serialize};
 use schemars::JsonSchema;
 use serde_json::json;
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 use chrono::DateTime;
 use chrono::Utc;
+use crate::query_intelligence::{RankedCandidate, temporal::parse_temporal_hint};
 
 use crate::config::SalienceConfig;
 use crate::embedding::{EmbeddingJob, EmbeddingProvider};
@@ -34,6 +35,9 @@ pub struct MemoryService {
     salience_config: SalienceConfig,
     start_time: Instant,
     extraction_pipeline: Option<crate::extraction::pipeline::ExtractionPipeline>,
+    qi_expansion_provider: Option<Arc<dyn crate::query_intelligence::QueryIntelligenceProvider + Send + Sync>>,
+    qi_reranking_provider: Option<Arc<dyn crate::query_intelligence::QueryIntelligenceProvider + Send + Sync>>,
+    qi_config: crate::config::QueryIntelligenceConfig,
 }
 
 impl MemoryService {
@@ -44,6 +48,9 @@ impl MemoryService {
         pg_store: Option<Arc<crate::store::postgres::PostgresMemoryStore>>,
         salience_config: SalienceConfig,
         extraction_pipeline: Option<crate::extraction::pipeline::ExtractionPipeline>,
+        qi_expansion_provider: Option<Arc<dyn crate::query_intelligence::QueryIntelligenceProvider + Send + Sync>>,
+        qi_reranking_provider: Option<Arc<dyn crate::query_intelligence::QueryIntelligenceProvider + Send + Sync>>,
+        qi_config: crate::config::QueryIntelligenceConfig,
     ) -> Self {
         Self {
             store,
@@ -53,6 +60,9 @@ impl MemoryService {
             salience_config,
             start_time: Instant::now(),
             extraction_pipeline,
+            qi_expansion_provider,
+            qi_reranking_provider,
+            qi_config,
         }
     }
 
@@ -682,9 +692,41 @@ impl MemoryService {
             }
         };
 
-        // 4. Optionally embed the query (graceful degradation to BM25-only if no provider)
+        // 4. Query Intelligence: expansion (if enabled)
+        let qi_start = Instant::now();
+        let qi_budget = Duration::from_millis(self.qi_config.latency_budget_ms);
+
+        let (search_query, qi_time_range) = if let Some(ref provider) = self.qi_expansion_provider {
+            let expansion_budget = qi_budget * 6 / 10; // 60% for expansion
+            match tokio::time::timeout(expansion_budget, provider.expand(&params.query)).await {
+                Ok(Ok(expanded)) => {
+                    tracing::info!(
+                        variants = expanded.variants.len(),
+                        has_time_range = expanded.time_range.is_some(),
+                        "Query expanded"
+                    );
+                    // Use first variant as the search query (best formulation)
+                    let best_query = expanded.variants.into_iter().next().unwrap_or_else(|| params.query.clone());
+                    (best_query, expanded.time_range)
+                }
+                Ok(Err(e)) => {
+                    tracing::warn!(error = %e, "Query expansion failed, using original query");
+                    (params.query.clone(), None)
+                }
+                Err(_) => {
+                    tracing::warn!(elapsed_ms = ?qi_start.elapsed().as_millis(), "Query expansion timed out, using original query");
+                    (params.query.clone(), None)
+                }
+            }
+        } else {
+            // No LLM expansion — try deterministic temporal fallback
+            let time_range = parse_temporal_hint(&params.query, Utc::now());
+            (params.query.clone(), time_range)
+        };
+
+        // 5. Optionally embed the search_query (graceful degradation to BM25-only if no provider)
         let query_embedding: Option<pgvector::Vector> = if let Some(ref provider) = self.embedding_provider {
-            match provider.embed(&params.query).await {
+            match provider.embed(&search_query).await {
                 Ok(vec) => Some(pgvector::Vector::from(vec)),
                 Err(e) => {
                     tracing::warn!("Failed to embed search query, falling back to BM25-only: {}", e);
@@ -695,7 +737,7 @@ impl MemoryService {
             None
         };
 
-        // 5. Parse optional datetime params
+        // 6. Parse optional datetime params
         let created_after = if let Some(ref s) = params.created_after {
             match parse_datetime(s, "created_after") {
                 Ok(dt) => Some(dt),
@@ -714,7 +756,7 @@ impl MemoryService {
             None
         };
 
-        // 6. Convert weight params to per-leg k values for RRF fusion.
+        // 7. Convert weight params to per-leg k values for RRF fusion.
         //    Formula: k = base_k / weight (lower k = more top-result influence).
         //    weight=0.0 → None (skip leg entirely).
         //    weight=None → default k (1.0 = no change to base_k).
@@ -746,12 +788,12 @@ impl MemoryService {
             })));
         }
 
-        // 7. Call hybrid_search — BM25 + vector + symbolic with three-way RRF fusion.
+        // 8. Call hybrid_search — BM25 + vector + symbolic with three-way RRF fusion.
         // Note: cursor-based pagination not applied at this level; salience re-ranking
         // must happen on the full result set before we can paginate meaningfully.
         let tags_slice: Option<Vec<String>> = params.tags.clone();
         let raw_hits = match pg_store.hybrid_search(
-            &params.query,
+            &search_query,
             query_embedding.as_ref(),
             limit as i64,
             created_after,
@@ -765,14 +807,14 @@ impl MemoryService {
             Err(e) => return Ok(store_error_to_result(e)),
         };
 
-        // 7. Fetch salience data for all result IDs
+        // 9. Fetch salience data for all result IDs
         let ids: Vec<String> = raw_hits.iter().map(|h| h.memory.id.clone()).collect();
         let salience_data = match pg_store.get_salience_data(&ids).await {
             Ok(data) => data,
             Err(e) => return Ok(store_error_to_result(e)),
         };
 
-        // 8. Build ScoredHit vec for salience re-ranking
+        // 10. Build ScoredHit vec for salience re-ranking
         let mut scored_hits: Vec<ScoredHit> = raw_hits
             .into_iter()
             .map(|hit| ScoredHit {
@@ -784,7 +826,7 @@ impl MemoryService {
             })
             .collect();
 
-        // 9. Build SalienceInput for each hit (parallel order to scored_hits)
+        // 11. Build SalienceInput for each hit (parallel order to scored_hits)
         let salience_inputs: Vec<SalienceInput> = scored_hits
             .iter()
             .map(|hit| {
@@ -805,11 +847,83 @@ impl MemoryService {
             })
             .collect();
 
-        // 10. Apply salience re-ranking
+        // 12. Apply salience re-ranking
         let scorer = SalienceScorer::new(&self.salience_config);
         scorer.rank(&mut scored_hits, &salience_inputs);
 
-        // 11. Format results
+        // 12.5 Apply temporal soft boost if time range extracted
+        if let Some(ref time_range) = qi_time_range {
+            for hit in &mut scored_hits {
+                let created = hit.memory.created_at;
+                let in_range = match (time_range.after, time_range.before) {
+                    (Some(after), Some(before)) => created >= after && created <= before,
+                    (Some(after), None) => created >= after,
+                    (None, Some(before)) => created <= before,
+                    (None, None) => false,
+                };
+                if in_range {
+                    hit.salience_score *= 2.0; // 2x boost for in-range memories (soft boost, not filter)
+                }
+            }
+            // Re-sort by boosted salience score
+            scored_hits.sort_by(|a, b| b.salience_score.partial_cmp(&a.salience_score).unwrap_or(std::cmp::Ordering::Equal));
+        }
+
+        // 12.75 LLM re-ranking (if enabled and budget remaining)
+        if let Some(ref provider) = self.qi_reranking_provider {
+            let remaining = qi_budget.saturating_sub(qi_start.elapsed());
+            if remaining > Duration::from_millis(100) { // Only attempt if >100ms remains
+                // Take top 10 for re-ranking (locked decision)
+                let top_n = scored_hits.len().min(10);
+                let candidates: Vec<RankedCandidate> = scored_hits[..top_n]
+                    .iter()
+                    .enumerate()
+                    .map(|(i, hit)| {
+                        let content = if hit.memory.content.len() > self.qi_config.rerank_content_chars {
+                            hit.memory.content[..self.qi_config.rerank_content_chars].to_string()
+                        } else {
+                            hit.memory.content.clone()
+                        };
+                        RankedCandidate {
+                            id: hit.memory.id.clone(),
+                            content,
+                            current_rank: i + 1,
+                        }
+                    })
+                    .collect();
+
+                match tokio::time::timeout(remaining, provider.rerank(&params.query, &candidates)).await {
+                    Ok(Ok(ranked)) => {
+                        tracing::info!(ranked_count = ranked.len(), "LLM re-ranking applied");
+                        // Blend: 0.7 * llm_rank_score + 0.3 * salience_score (normalized)
+                        // llm_rank_score = 1.0 / (1.0 + llm_rank as f64)
+                        let max_salience = scored_hits.iter().map(|h| h.salience_score).fold(f64::MIN, f64::max);
+                        let min_salience = scored_hits.iter().map(|h| h.salience_score).fold(f64::MAX, f64::min);
+                        let salience_range = (max_salience - min_salience).max(1e-6);
+
+                        for hit in scored_hits[..top_n].iter_mut() {
+                            if let Some(r) = ranked.iter().find(|r| r.id == hit.memory.id) {
+                                let llm_score = 1.0 / (1.0 + r.llm_rank as f64);
+                                let norm_salience = (hit.salience_score - min_salience) / salience_range;
+                                hit.salience_score = 0.7 * llm_score + 0.3 * norm_salience;
+                            }
+                        }
+                        // Re-sort top_n portion only
+                        scored_hits[..top_n].sort_by(|a, b| b.salience_score.partial_cmp(&a.salience_score).unwrap_or(std::cmp::Ordering::Equal));
+                    }
+                    Ok(Err(e)) => {
+                        tracing::warn!(error = %e, "LLM re-ranking failed, keeping salience order");
+                    }
+                    Err(_) => {
+                        tracing::warn!(elapsed_ms = ?qi_start.elapsed().as_millis(), "LLM re-ranking timed out, keeping salience order");
+                    }
+                }
+            } else {
+                tracing::debug!(remaining_ms = ?remaining.as_millis(), "Skipping re-ranking — insufficient budget remaining");
+            }
+        }
+
+        // 13. Format results
         let count = scored_hits.len();
         let results: Vec<serde_json::Value> = scored_hits.iter().map(|hit| {
             let mut obj = json!({
@@ -837,7 +951,7 @@ impl MemoryService {
             obj
         }).collect();
 
-        // 12. Build final response JSON
+        // 14. Build final response JSON
         let mut response = json!({
             "memories": results,
             "total_results": count,
