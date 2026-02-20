@@ -4,7 +4,9 @@
 /// for benchmarking the memcp search pipeline against the LongMemEval dataset.
 
 pub mod dataset;
+pub mod evaluate;
 pub mod ingest;
+pub mod prompts;
 
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
