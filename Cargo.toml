@@ -18,7 +18,7 @@ figment = { version = "0.10", features = ["toml", "env"] }
 uuid = { version = "1", features = ["v4"] }
 chrono = { version = "0.4", features = ["serde"] }
 sqlx = { version = "0.8", features = ["runtime-tokio", "postgres", "chrono", "uuid", "json", "migrate"] }
-clap = { version = "4", features = ["derive"] }
+clap = { version = "4", features = ["derive", "env"] }
 async-trait = "0.1"
 base64 = "0.22"
 dirs = "6"
@@ -26,3 +26,8 @@ fastembed = "5"
 pgvector = { version = "0.4", features = ["sqlx"] }
 reqwest = { version = "0.12", features = ["json"] }
 regex = "1"
+indicatif = "0.17"
+
+[[bin]]
+name = "benchmark"
+path = "src/bin/benchmark.rs"

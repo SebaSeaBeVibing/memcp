@@ -264,6 +264,7 @@ impl MemoryService {
             type_hint: params.type_hint.unwrap_or_else(|| "fact".to_string()),
             source: params.source.unwrap_or_else(|| "default".to_string()),
             tags: params.tags,
+            created_at: None,
         };
 
         match self.store.store(input).await {

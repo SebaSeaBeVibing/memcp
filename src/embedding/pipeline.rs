@@ -4,6 +4,7 @@
 /// Failed embeddings are retried up to 3 times with exponential backoff (1s, 2s, 4s),
 /// then marked as failed for backfill on next startup.
 
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::mpsc;
@@ -18,6 +19,9 @@ use crate::store::postgres::PostgresMemoryStore;
 /// processes them in a background tokio task.
 pub struct EmbeddingPipeline {
     sender: mpsc::Sender<EmbeddingJob>,
+    /// Count of jobs currently in-flight (enqueued but not yet completed).
+    /// Used by flush() to block until the pipeline drains.
+    pending_count: Arc<AtomicUsize>,
 }
 
 impl EmbeddingPipeline {
@@ -37,6 +41,10 @@ impl EmbeddingPipeline {
         let (tx, mut rx) = mpsc::channel::<EmbeddingJob>(capacity);
         // Clone tx for retry re-sends inside the worker
         let retry_tx = tx.clone();
+
+        // Shared counter tracking jobs currently in-flight (enqueued but not completed).
+        let pending_count = Arc::new(AtomicUsize::new(0));
+        let worker_pending = Arc::clone(&pending_count);
 
         tokio::spawn(async move {
             while let Some(job) = rx.recv().await {
@@ -58,6 +66,7 @@ impl EmbeddingPipeline {
                             );
                             // Storage error is not retryable — mark as failed
                             let _ = store.update_embedding_status(&job.memory_id, "failed").await;
+                            worker_pending.fetch_sub(1, Ordering::Relaxed);
                         } else {
                             let _ = store.update_embedding_status(&job.memory_id, "complete").await;
                             tracing::debug!(memory_id = %job.memory_id, "Embedding complete");
@@ -85,6 +94,7 @@ impl EmbeddingPipeline {
                                     }
                                 }
                             }
+                            worker_pending.fetch_sub(1, Ordering::Relaxed);
                         }
                     }
                     Err(e) if job.attempt < 3 => {
@@ -97,7 +107,7 @@ impl EmbeddingPipeline {
                         // Exponential backoff: 1s, 2s, 4s
                         let delay = Duration::from_secs(2u64.pow(job.attempt as u32));
                         tokio::time::sleep(delay).await;
-                        // Re-enqueue with incremented attempt
+                        // Re-enqueue with incremented attempt (pending_count stays the same — job continues)
                         let _ = retry_tx.try_send(EmbeddingJob {
                             attempt: job.attempt + 1,
                             ..job
@@ -111,12 +121,13 @@ impl EmbeddingPipeline {
                             "Embedding failed after 3 retries, marking as failed"
                         );
                         let _ = store.update_embedding_status(&job.memory_id, "failed").await;
+                        worker_pending.fetch_sub(1, Ordering::Relaxed);
                     }
                 }
             }
         });
 
-        EmbeddingPipeline { sender: tx }
+        EmbeddingPipeline { sender: tx, pending_count }
     }
 
     /// Enqueue an embedding job (non-blocking).
@@ -124,7 +135,10 @@ impl EmbeddingPipeline {
     /// Uses try_send — if the channel is full, the job is dropped and a warning is logged.
     /// The backfill process will pick up missed memories on next startup.
     pub fn enqueue(&self, job: EmbeddingJob) {
+        self.pending_count.fetch_add(1, Ordering::Relaxed);
         if let Err(_) = self.sender.try_send(job) {
+            // Job dropped — decrement since no worker will process it
+            self.pending_count.fetch_sub(1, Ordering::Relaxed);
             tracing::warn!(
                 "Embedding queue full — memory stored, embedding deferred to backfill"
             );
@@ -134,6 +148,20 @@ impl EmbeddingPipeline {
     /// Return a clone of the underlying mpsc sender (for use with the backfill function).
     pub fn sender(&self) -> mpsc::Sender<EmbeddingJob> {
         self.sender.clone()
+    }
+
+    /// Wait until all enqueued embedding jobs have completed (success or failure).
+    /// Polls pending count every 100ms. Used by benchmark to ensure all embeddings
+    /// are complete before running search.
+    pub async fn flush(&self) {
+        loop {
+            let pending = self.pending_count.load(Ordering::Relaxed);
+            if pending == 0 {
+                break;
+            }
+            tracing::debug!(pending, "Waiting for embedding pipeline to flush");
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        }
     }
 }
 
