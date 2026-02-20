@@ -26,3 +26,8 @@ fastembed = "5"
 pgvector = { version = "0.4", features = ["sqlx"] }
 reqwest = { version = "0.12", features = ["json"] }
 regex = "1"
+indicatif = "0.17"
+
+[[bin]]
+name = "benchmark"
+path = "src/bin/benchmark.rs"

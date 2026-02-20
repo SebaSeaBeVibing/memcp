@@ -63,6 +63,10 @@ pub struct CreateMemory {
     pub source: String,
     /// Optional tags for categorization
     pub tags: Option<Vec<String>>,
+    /// Optional timestamp override. When set, the store uses this instead of Utc::now().
+    /// Used by benchmark harness for ingesting historical sessions.
+    #[serde(default)]
+    pub created_at: Option<DateTime<Utc>>,
 }
 
 fn default_type_hint() -> String {

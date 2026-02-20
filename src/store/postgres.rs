@@ -116,6 +116,16 @@ impl PostgresMemoryStore {
         Ok(PostgresMemoryStore { pool, paradedb_available, use_paradedb })
     }
 
+    /// Truncate all benchmark-relevant tables: memories, memory_embeddings, memory_salience, memory_consolidations.
+    /// Uses TRUNCATE ... CASCADE for speed. Benchmark-only — not exposed via MCP.
+    pub async fn truncate_all(&self) -> Result<(), MemcpError> {
+        sqlx::query("TRUNCATE memories, memory_embeddings, memory_salience, memory_consolidations CASCADE")
+            .execute(&self.pool)
+            .await
+            .map_err(|e| MemcpError::Storage(format!("Failed to truncate tables: {}", e)))?;
+        Ok(())
+    }
+
     /// Detect whether the ParadeDB pg_search extension is installed on this PostgreSQL instance.
     ///
     /// Queries the pg_extension catalog once at startup. Returns true if pg_search is present.
@@ -195,7 +205,7 @@ fn row_to_memory(row: &PgRow) -> Result<Memory, MemcpError> {
 impl MemoryStore for PostgresMemoryStore {
     async fn store(&self, input: CreateMemory) -> Result<Memory, MemcpError> {
         let id = Uuid::new_v4().to_string();
-        let now = Utc::now();
+        let now = input.created_at.unwrap_or_else(Utc::now);
 
         // Convert tags Vec<String> to serde_json::Value for JSONB binding
         let tags_json: Option<serde_json::Value> = input
